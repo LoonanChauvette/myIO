@@ -5,6 +5,7 @@ Supports optional config-folder profiles (JSON).
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -739,8 +740,11 @@ class DeviceConfigSelector(QDialog):
         config_dir: str | Path | None = None,
         profile: str | None = None,
         parent: QWidget | None = None,
-    ) -> AudioEngineConfig | None:
-        """Show the dialog modally and return the config, or None if cancelled."""
+    ) -> AudioEngineConfig:
+        """Show the dialog modally and return the config.
+
+        Exits the process with status 0 if the user cancels.
+        """
         created_app = QApplication.instance() is None
         app = QApplication([]) if created_app else QApplication.instance()
         assert app is not None
@@ -757,4 +761,6 @@ class DeviceConfigSelector(QDialog):
         if created_app:
             app.quit()
             app.processEvents()
+        if config is None:
+            sys.exit(0)
         return config

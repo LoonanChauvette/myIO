@@ -115,7 +115,11 @@ class AudioEngineConfig:
         config_dir: PathLike | None = None,
         profile: str | None = None,
         parent: Any | None = None,
-    ) -> AudioEngineConfig | None:
+    ) -> AudioEngineConfig:
+        """Show the device selector and return a config.
+
+        Exits the process with status 0 if the user cancels.
+        """
         from .selector import DeviceConfigSelector
 
         return DeviceConfigSelector.select(
