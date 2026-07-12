@@ -1,0 +1,21 @@
+[project]
+name = "myio"
+version = "0.1.0"
+description = "Sounddevice AudioEngine with device selection and player mixing"
+readme = "README.md"
+authors = [
+    { name = "Loonan Chauvette", email = "loonan.chauvette@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.1",
+    "pyside6>=6.11.1",
+    "sounddevice>=0.5.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ty.environment]
+python = ".venv"

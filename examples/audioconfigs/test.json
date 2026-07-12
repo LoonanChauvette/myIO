@@ -1,0 +1,16 @@
+{
+  "api": "wasapi",
+  "exclusive": true,
+  "stream": {
+    "samplerate": 44100.0,
+    "device": 8,
+    "channels": 2,
+    "dtype": "float32",
+    "blocksize": 32,
+    "latency": "low",
+    "clip_off": false,
+    "dither_off": false,
+    "never_drop_input": false,
+    "prime_output_buffers_using_stream_callback": false
+  }
+}
