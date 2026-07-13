@@ -1,11 +1,18 @@
+from dataclasses import dataclass
+from enum import Enum
+from threading import Lock
+from typing import Literal, Protocol, TypedDict, Unpack
 
-import sounddevice as sd
 import numpy as np
 import numpy.typing as npt
-from dataclasses import dataclass
+import sounddevice as sd
 
-from typing import Protocol
-from threading import Lock
+
+class CallbackTime(Protocol):
+    currentTime: float
+    inputBufferAdcTime: float
+    outputBufferDacTime: float
+
 
 @dataclass(frozen=True)
 class AudioContext:
@@ -15,10 +22,24 @@ class AudioContext:
     time: CallbackTime
     status: sd.CallbackFlags
 
-class CallbackTime(Protocol):
-    currentTime: float
-    inputBufferAdcTime: float
-    outputBufferDacTime: float
+
+AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
+StreamLatency = Literal["low", "high"]
+
+
+class OutputStreamKwargs(TypedDict, total=False):
+    samplerate: float
+    blocksize: int
+    device: int | str
+    channels: int
+    dtype: AudioType | np.dtype
+    latency: StreamLatency | float
+    extra_settings: sd.AsioSettings | sd.CoreAudioSettings | sd.WasapiSettings
+    clip_off: bool
+    dither_off: bool
+    never_drop_input: bool
+    prime_output_buffers_using_stream_callback: bool
+
 
 class Player(Protocol):
     """Players should implement ``mix`` by adding their audio output into the
@@ -32,11 +53,13 @@ class Player(Protocol):
                 samples = generate_audio(context.frames, context.samplerate)
                 buffer += samples
     """
+
     def mix(
         self,
         buffer: npt.NDArray[np.float32],
         context: AudioContext,
     ) -> None: ...
+
 
 class AudioEngine:
     def __init__(self, **kwargs):
@@ -44,18 +67,18 @@ class AudioEngine:
         self._players: list[Player] = []
         self._frame: int = 0
 
-        self.stream = sd.OutputStream(
-            callback=self.callback,
-            **kwargs
-        )
+        self.stream = sd.OutputStream(callback=self.callback, **kwargs)
         self.channels = self.stream.channels
         self.blocksize = self.stream.blocksize
         self.samplerate = self.stream.samplerate
 
-
     @classmethod
     def default(cls):
         return cls()
+
+    @classmethod
+    def from_args(cls, **kwargs: Unpack[OutputStreamKwargs]):
+        return cls(**kwargs)
 
     @classmethod
     def from_dict(cls, config: dict):
