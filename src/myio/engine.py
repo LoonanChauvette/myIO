@@ -24,7 +24,7 @@ class AudioEngine:
     """
 
     def __init__(self, config: AudioEngineConfig | None = None) -> None:
-        self.config = config or AudioEngineConfig.default()
+        self.config = (config or AudioEngineConfig.default()).resolve()
         self.api = self.config.api
         self.exclusive = self.config.exclusive
         self._lock = threading.Lock()

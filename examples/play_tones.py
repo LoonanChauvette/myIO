@@ -43,8 +43,8 @@ class Tone:
 
 def main() -> None:
     #config = AudioEngineConfig.default()
-    config = AudioEngineConfig.from_selector(config_dir=CONFIG_DIR)
-    #config = AudioEngineConfig.from_file(path=CONFIG_DIR / "default.json")
+    #config = AudioEngineConfig.from_selector(config_dir=CONFIG_DIR)
+    config = AudioEngineConfig.from_file(path=CONFIG_DIR / "basic.json")
 
     print(f"Using config: {config}")
     engine = AudioEngine(config)

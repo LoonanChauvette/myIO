@@ -1,5 +1,6 @@
 {
   "api": "Windows WASAPI",
+  "device_name": "Speakers (2- Realtek(R) Audio)",
   "exclusive": true,
   "stream": {
     "samplerate": 44100.0,

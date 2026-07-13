@@ -39,7 +39,7 @@ class Tone:
 
 ## Profiles
 
-JSON under a config folder. `from_selector(config_dir=..., profile=...)` opens the UI with that folder / profile. Use `Save` in the dialog to write profiles; `list_profiles` / `profile_path` help manage them from code.
+JSON under a config folder. Profiles store both `device` (PortAudio index) and `device_name`; on load the index is rematched by name under the saved host API and channel count. If nothing matches, `DeviceResolveError` lists eligible devices and a `from_selector(...)` command to fix the profile. `from_selector(config_dir=..., profile=...)` opens the UI; use Save to write profiles.
 
 ## Example
 

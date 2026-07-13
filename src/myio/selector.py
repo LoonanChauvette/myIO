@@ -511,19 +511,33 @@ class DeviceConfigSelector(QDialog):
                 bool(config.exclusive) and "WASAPI" in config.api.upper()
             )
 
+            # Prefer device name (stable across replug); fall back to index.
             device_id = config.stream.device
+            device_name = config.device_name
             found = False
             for i in range(self.device_combo.count()):
                 data = self.device_combo.itemData(i)
-                if data and data[0] == device_id:
+                if data and device_name and self.device_combo.itemText(i) == device_name:
                     self.device_combo.setCurrentIndex(i)
                     found = True
                     break
+            if not found:
+                for i in range(self.device_combo.count()):
+                    data = self.device_combo.itemData(i)
+                    if data and data[0] == device_id:
+                        self.device_combo.setCurrentIndex(i)
+                        found = True
+                        break
             if not found and self.device_combo.count() > 0:
+                label = (
+                    f"“{device_name}” (index {device_id})"
+                    if device_name
+                    else f"index {device_id}"
+                )
                 QMessageBox.warning(
                     self,
                     "Device not found",
-                    f"Saved device index {device_id} is not available "
+                    f"Saved device {label} is not available "
                     f"on this system for API “{config.api}”. Using the first device.",
                 )
                 self.device_combo.setCurrentIndex(0)
@@ -699,6 +713,7 @@ class DeviceConfigSelector(QDialog):
                 prime_output_buffers_using_stream_callback=self.prime_check.isChecked(),
             ),
             api=api_name,
+            device_name=self.device_combo.currentText(),
             exclusive=self.exclusive_check.isChecked()
             and "WASAPI" in api_name.upper(),
         )
