@@ -1,11 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from enum import Enum
 from threading import Lock
 from typing import Literal, Protocol, TypedDict, Unpack
 
 import numpy as np
 import numpy.typing as npt
 import sounddevice as sd
+
+from myio.players import Player
+
+AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
+StreamLatency = Literal["low", "high"]
 
 
 class CallbackTime(Protocol):
@@ -23,10 +29,6 @@ class AudioContext:
     status: sd.CallbackFlags
 
 
-AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
-StreamLatency = Literal["low", "high"]
-
-
 class OutputStreamKwargs(TypedDict, total=False):
     samplerate: float
     blocksize: int
@@ -41,68 +43,48 @@ class OutputStreamKwargs(TypedDict, total=False):
     prime_output_buffers_using_stream_callback: bool
 
 
-class Player(Protocol):
-    """Players should implement ``mix`` by adding their audio output into the
-    provided buffer. The buffer is shared with other players, so it should
-    not be replaced.
-
-    Example::
-
-        class SinePlayer:
-            def mix(self, buffer, context) -> None:
-                samples = generate_audio(context.frames, context.samplerate)
-                buffer += samples
-    """
-
-    def mix(
-        self,
-        buffer: npt.NDArray[np.float32],
-        context: AudioContext,
-    ) -> None: ...
-
-
 class AudioEngine:
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs) -> None:
         self._lock = Lock()
         self._players: list[Player] = []
         self._frame: int = 0
 
         self.stream = sd.OutputStream(callback=self.callback, **kwargs)
-        self.channels = self.stream.channels
-        self.blocksize = self.stream.blocksize
-        self.samplerate = self.stream.samplerate
+        self.channels: int = self.stream.channels
+        self.blocksize: int = self.stream.blocksize
+        self.samplerate: int = self.stream.samplerate
 
     @classmethod
-    def default(cls):
+    def default(cls) -> AudioEngine:
         return cls()
 
     @classmethod
-    def from_args(cls, **kwargs: Unpack[OutputStreamKwargs]):
+    def from_args(cls, **kwargs: Unpack[OutputStreamKwargs]) -> AudioEngine:
         return cls(**kwargs)
 
     @classmethod
-    def from_dict(cls, config: dict):
+    def from_dict(cls, config: dict) -> AudioEngine:
         return cls(**config)
 
     # TODO: hook up from_file and from selector
 
-    def add_player(self, player: Player):
+    def add_player(self, player: Player) -> None:
         with self._lock:
             self._players.append(player)
 
-    def remove_player(self, player: Player):
+    def remove_player(self, player: Player) -> None:
         with self._lock:
             self._players.remove(player)
 
-    def start(self):
+    def start(self) -> None:
         if not self.stream.active:
             self.stream.start()
 
-    def stop(self):
+    def stop(self) -> None:
         if self.stream.active:
             self.stream.stop()
 
-    def close(self):
+    def close(self) -> None:
         if self.stream.active:
             self.stream.stop()
         self.stream.close()

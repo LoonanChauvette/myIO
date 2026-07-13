@@ -19,8 +19,3 @@ build-backend = "uv_build"
 
 [tool.ty.environment]
 python = ".venv"
-
-[tool.basedpyright]
-venvPath = "."
-venv = ".venv"
-typeCheckingMode = "standard"
