@@ -1,5 +1,7 @@
-from myio import AudioEngine
+from myio import AudioEngine, select_audio_config
 
 if __name__ == "__main__":
-    engine = AudioEngine.from_args(samplerate=48000, channels=2, latency="high")
+    # engine = AudioEngine.from_args(samplerate=48000, channels=2, latency="high")
+    config = select_audio_config(open_ui=True)
+    engine = AudioEngine.from_dict(config)
     engine.start()

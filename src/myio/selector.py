@@ -1,13 +1,14 @@
-"""Audio device selector dialog using PySide6.
+"""Audio device selector and profile loading.
 
-Returns an ``AudioEngineConfig`` for constructing an ``AudioEngine``.
-Supports optional config-folder profiles (JSON).
+``select_audio_config`` is the public entry point: load a profile JSON or open
+the PySide6 UI, and return flat ``OutputStreamKwargs`` for ``AudioEngine``.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import sounddevice as sd
@@ -31,14 +32,259 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .config import (
-    AudioEngineConfig,
-    Dtype,
-    Latency,
-    StreamConfig,
-    list_profiles,
-    profile_path,
-)
+if TYPE_CHECKING:
+    from myio.engine import OutputStreamKwargs
+
+PathLike = str | Path
+
+_STREAM_DEFAULTS: dict[str, Any] = {
+    "dtype": "float32",
+    "blocksize": 0,
+    "latency": "high",
+    "clip_off": False,
+    "dither_off": False,
+    "never_drop_input": False,
+    "prime_output_buffers_using_stream_callback": False,
+}
+
+
+class DeviceResolveError(LookupError):
+    """Raised when a saved device cannot be rematched on this system."""
+
+
+def select_audio_config(
+    *,
+    config_path: PathLike | None = None,
+    config_folder: PathLike | None = None,
+    open_ui: bool = False,
+) -> OutputStreamKwargs:
+    """Return flat stream kwargs for ``AudioEngine`` / ``sd.OutputStream``.
+
+    * ``open_ui=True`` — show the device selector dialog.
+    * ``open_ui=False`` — require ``config_path``; load, resolve, and flatten.
+
+    Exits the process with status 0 if the user cancels the UI.
+    """
+    if open_ui:
+        folder: Path | None = None
+        profile: str | None = None
+        if config_folder is not None:
+            folder = Path(config_folder)
+        elif config_path is not None:
+            path = Path(config_path)
+            folder = path.parent
+            profile = path.stem
+        nested = DeviceConfigSelector.select(
+            config_dir=folder, profile=profile
+        )
+        return _profile_to_stream_kwargs(nested)
+
+    if config_path is None:
+        raise ValueError(
+            "select_audio_config() requires config_path when open_ui=False.\n"
+            "Pass config_path=... to load a saved profile, or open_ui=True to "
+            "pick a device interactively."
+        )
+
+    path = Path(config_path)
+    profile = _read_profile(path)
+    resolved = _resolve_profile(profile, config_path=path)
+    return _profile_to_stream_kwargs(resolved)
+
+
+# --- profile helpers (private) --------------------------------------------
+
+
+def _profile_path(config_dir: PathLike, profile: str) -> Path:
+    name = profile.strip()
+    if not name.lower().endswith(".json"):
+        name = f"{name}.json"
+    return Path(config_dir) / name
+
+
+def _list_profiles(config_dir: PathLike) -> list[str]:
+    path = Path(config_dir)
+    if not path.is_dir():
+        return []
+    return sorted(p.stem for p in path.glob("*.json") if p.is_file())
+
+
+def _normalize_stream(data: dict[str, Any]) -> dict[str, Any]:
+    stream = dict(_STREAM_DEFAULTS)
+    for key, value in data.items():
+        if value is not None:
+            stream[key] = value
+    required = ("samplerate", "device", "channels")
+    missing = [k for k in required if k not in stream]
+    if missing:
+        raise ValueError(f"stream config missing required field(s): {', '.join(missing)}")
+    stream["samplerate"] = float(stream["samplerate"])
+    stream["device"] = int(stream["device"])
+    stream["channels"] = int(stream["channels"])
+    stream["blocksize"] = int(stream["blocksize"])
+    stream["clip_off"] = bool(stream["clip_off"])
+    stream["dither_off"] = bool(stream["dither_off"])
+    stream["never_drop_input"] = bool(stream["never_drop_input"])
+    stream["prime_output_buffers_using_stream_callback"] = bool(
+        stream["prime_output_buffers_using_stream_callback"]
+    )
+    return stream
+
+
+def _normalize_profile(data: dict[str, Any]) -> dict[str, Any]:
+    api = data.get("api")
+    if not api:
+        raise ValueError("config missing required field: api")
+    stream = _normalize_stream(dict(data.get("stream") or {}))
+    device_name = data.get("device_name")
+    if not device_name:
+        try:
+            device_name = str(sd.query_devices(stream["device"])["name"])
+        except Exception:
+            device_name = ""
+    return {
+        "api": str(api),
+        "device_name": str(device_name),
+        "exclusive": bool(data.get("exclusive", False)),
+        "stream": stream,
+    }
+
+
+def _read_profile(path: PathLike) -> dict[str, Any]:
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid config file (expected object): {path}")
+    return _normalize_profile(data)
+
+
+def _write_profile(path: PathLike, profile: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+
+
+def _selector_hint(config_path: PathLike | None) -> str:
+    if config_path is not None:
+        path = Path(config_path)
+        return (
+            "Open the selector to pick a valid device and Save the profile, e.g.\n"
+            "  python -c \"from myio import select_audio_config; "
+            f"select_audio_config(config_path=r'{path.as_posix()}', open_ui=True)\""
+        )
+    return (
+        "Open the selector to pick a valid device and Save the profile, e.g.\n"
+        "  python -c \"from myio import select_audio_config; "
+        "select_audio_config(config_folder='YOUR_CONFIG_DIR', open_ui=True)\""
+    )
+
+
+def _device_resolve_message(
+    *,
+    api: str,
+    device_name: str,
+    device: int,
+    channels: int,
+    eligible: list[tuple[int, str, int]],
+    config_path: PathLike | None,
+) -> str:
+    wanted = (
+        f"device_name={device_name!r}, device={device}, "
+        f"api={api!r}, channels>={channels}"
+    )
+    if eligible:
+        lines = "\n".join(
+            f"  [{i}] {name}  (max_output_channels={max_ch})"
+            for i, name, max_ch in eligible
+        )
+        available = (
+            f"Output devices on {api!r} with at least {channels} channel(s):\n{lines}"
+        )
+    else:
+        available = (
+            f"No output devices on {api!r} provide at least {channels} channel(s)."
+        )
+    return (
+        f"Could not resolve audio device ({wanted}).\n"
+        f"{available}\n"
+        f"{_selector_hint(config_path)}"
+    )
+
+
+def _resolve_profile(
+    profile: dict[str, Any],
+    *,
+    config_path: PathLike | None = None,
+) -> dict[str, Any]:
+    """Rematch ``stream.device`` using ``device_name``, ``api``, and channels."""
+    stream = dict(profile["stream"])
+    channels = int(stream["channels"])
+    api = str(profile["api"])
+    device_name = str(profile.get("device_name") or "")
+    device = int(stream["device"])
+
+    api_id = next(
+        (
+            i
+            for i, host in enumerate(sd.query_hostapis())
+            if host["name"] == api
+        ),
+        None,
+    )
+    if api_id is None:
+        apis = ", ".join(repr(h["name"]) for h in sd.query_hostapis()) or "(none)"
+        raise DeviceResolveError(
+            f"Host API {api!r} is not available on this system.\n"
+            f"Available host APIs: {apis}\n"
+            f"{_selector_hint(config_path)}"
+        )
+
+    eligible: list[tuple[int, str, int]] = []
+    for i, dev in enumerate(sd.query_devices()):
+        max_ch = int(dev["max_output_channels"])
+        if max_ch < channels:
+            continue
+        if int(dev["hostapi"]) != api_id:
+            continue
+        eligible.append((i, str(dev["name"]), max_ch))
+
+    if device_name:
+        by_name = [
+            (i, name, max_ch)
+            for i, name, max_ch in eligible
+            if name == device_name
+        ]
+        if device in {i for i, _, _ in by_name}:
+            return profile
+        if by_name:
+            stream["device"] = by_name[0][0]
+            return {**profile, "stream": stream}
+    else:
+        for i, name, _max_ch in eligible:
+            if i == device:
+                return {**profile, "device_name": name}
+
+    raise DeviceResolveError(
+        _device_resolve_message(
+            api=api,
+            device_name=device_name,
+            device=device,
+            channels=channels,
+            eligible=eligible,
+            config_path=config_path,
+        )
+    )
+
+
+def _profile_to_stream_kwargs(profile: dict[str, Any]) -> OutputStreamKwargs:
+    """Flatten a nested profile into ``sd.OutputStream`` kwargs."""
+    kwargs: dict[str, Any] = dict(profile["stream"])
+    if profile.get("exclusive") and "WASAPI" in str(profile.get("api", "")).upper():
+        kwargs["extra_settings"] = sd.WasapiSettings(exclusive=True)
+    return cast("OutputStreamKwargs", kwargs)
+
+
+# --- device enumeration ---------------------------------------------------
 
 
 def list_apis() -> list[tuple[int, str]]:
@@ -68,7 +314,11 @@ def list_output_devices(api_id: int | None = None) -> list[tuple[int, str, int]]
     return out
 
 
-def test_silent_output(config: AudioEngineConfig, *, duration: float = 0.05) -> None:
+def test_silent_output(
+    stream_kwargs: OutputStreamKwargs,
+    *,
+    duration: float = 0.05,
+) -> None:
     """Open the configured output briefly and write silence.
 
     Raises on PortAudio / device errors.
@@ -82,20 +332,22 @@ def test_silent_output(config: AudioEngineConfig, *, duration: float = 0.05) -> 
     ) -> None:
         outdata.fill(0)
 
-    with sd.OutputStream(callback=callback, **config.stream_kwargs()):
+    with sd.OutputStream(callback=callback, **stream_kwargs):
         sd.sleep(int(duration * 1000))
 
 
 def _clear_layout(layout: QHBoxLayout) -> None:
     while layout.count():
         item = layout.takeAt(0)
+        if item is None:
+            continue
         widget = item.widget()
         if widget is not None:
             widget.deleteLater()
 
 
 class DeviceConfigSelector(QDialog):
-    """Modal dialog that returns an ``AudioEngineConfig``."""
+    """Modal dialog that returns a nested profile dict."""
 
     def __init__(
         self,
@@ -284,7 +536,7 @@ class DeviceConfigSelector(QDialog):
         else:
             self.folder_edit.clear()
 
-        profiles = list_profiles(self._config_dir) if self._config_dir else []
+        profiles = _list_profiles(self._config_dir) if self._config_dir else []
         if "default" in profiles:
             profiles = ["default", *[p for p in profiles if p != "default"]]
         choose = (selected or self.profile_name_edit.text() or "").strip()
@@ -345,13 +597,13 @@ class DeviceConfigSelector(QDialog):
 
     def _mark_clean(self, snapshot: dict[str, Any] | None = None) -> None:
         self._saved_snapshot = (
-            snapshot if snapshot is not None else self._collect_config().to_dict()
+            snapshot if snapshot is not None else self._collect_profile()
         )
 
     def _is_dirty(self) -> bool:
         if self._saved_snapshot is None:
             return True
-        return self._collect_config().to_dict() != self._saved_snapshot
+        return self._collect_profile() != self._saved_snapshot
 
     def _confirm_discard_if_dirty(self) -> bool:
         if not self._is_dirty():
@@ -374,7 +626,7 @@ class DeviceConfigSelector(QDialog):
             return
         self._config_dir = Path(chosen)
         self._refresh_profile_ui()
-        profiles = list_profiles(self._config_dir)
+        profiles = _list_profiles(self._config_dir)
         if profiles:
             self._load_profile(profiles[0])
         else:
@@ -414,16 +666,17 @@ class DeviceConfigSelector(QDialog):
         if self._config_dir is None:
             return False
         stem = name[:-5] if name.lower().endswith(".json") else name.strip()
-        path = profile_path(self._config_dir, stem)
+        path = _profile_path(self._config_dir, stem)
         if not path.is_file():
             return False
         try:
-            config = AudioEngineConfig.from_file(path)
+            profile = _read_profile(path)
+            profile = _resolve_profile(profile, config_path=path)
         except Exception as exc:
             QMessageBox.warning(self, "Could not load profile", str(exc))
             return False
         self._set_profile_name(stem)
-        self._apply_config(config)
+        self._apply_profile(profile)
         # Snapshot what the form actually holds (may coerce some fields).
         self._mark_clean()
         self.loaded_profile_label.setText(f"Loaded: {stem}.json")
@@ -439,14 +692,14 @@ class DeviceConfigSelector(QDialog):
         if not name:
             QMessageBox.warning(self, "Missing profile name", "Enter a profile name.")
             return False
-        path = profile_path(self._config_dir, name)
-        config = self._collect_config()
+        path = _profile_path(self._config_dir, name)
+        profile = self._collect_profile()
         if path.is_file():
             try:
-                existing = AudioEngineConfig.from_file(path).to_dict()
+                existing = _read_profile(path)
             except Exception:
                 existing = None
-            if existing is not None and existing != config.to_dict():
+            if existing is not None and existing != profile:
                 result = QMessageBox.question(
                     self,
                     "Overwrite profile?",
@@ -457,13 +710,13 @@ class DeviceConfigSelector(QDialog):
                 if result != QMessageBox.StandardButton.Yes:
                     return False
         try:
-            config.to_file(path)
+            _write_profile(path, profile)
         except OSError as exc:
             QMessageBox.warning(self, "Save failed", str(exc))
             return False
         self._refresh_profile_ui(selected=name)
         self._set_profile_name(name)
-        self._mark_clean(config.to_dict())
+        self._mark_clean(profile)
         if not quiet:
             QMessageBox.information(self, "Saved", f"Saved profile to\n{path}")
         return True
@@ -492,13 +745,18 @@ class DeviceConfigSelector(QDialog):
 
     # --- device form ------------------------------------------------------
 
-    def _apply_config(self, config: AudioEngineConfig) -> None:
+    def _apply_profile(self, profile: dict[str, Any]) -> None:
         self._loading = True
         try:
+            api = str(profile["api"])
+            stream = profile["stream"]
+            device_name = str(profile.get("device_name") or "")
+            exclusive = bool(profile.get("exclusive", False))
+
             api_index = 0
             for i in range(self.api_combo.count()):
                 data = self.api_combo.itemData(i)
-                if data is not None and sd.query_hostapis(data)["name"] == config.api:
+                if data is not None and sd.query_hostapis(data)["name"] == api:
                     api_index = i
                     break
             if self.api_combo.currentIndex() == api_index:
@@ -508,12 +766,11 @@ class DeviceConfigSelector(QDialog):
 
             # Exclusive is WASAPI-only; _on_api_changed clears it for other APIs.
             self.exclusive_check.setChecked(
-                bool(config.exclusive) and "WASAPI" in config.api.upper()
+                exclusive and "WASAPI" in api.upper()
             )
 
             # Prefer device name (stable across replug); fall back to index.
-            device_id = config.stream.device
-            device_name = config.device_name
+            device_id = int(stream["device"])
             found = False
             for i in range(self.device_combo.count()):
                 data = self.device_combo.itemData(i)
@@ -538,54 +795,54 @@ class DeviceConfigSelector(QDialog):
                     self,
                     "Device not found",
                     f"Saved device {label} is not available "
-                    f"on this system for API “{config.api}”. Using the first device.",
+                    f"on this system for API “{api}”. Using the first device.",
                 )
                 self.device_combo.setCurrentIndex(0)
                 self._on_device_changed(0)
 
-            btn = self.channels_group.button(int(config.stream.channels))
+            btn = self.channels_group.button(int(stream["channels"]))
             if btn is not None:
                 btn.setChecked(True)
 
-            text = str(int(config.stream.samplerate))
+            text = str(int(stream["samplerate"]))
             idx = self.fs_combo.findText(text)
             if idx < 0:
                 self.fs_combo.addItem(text)
                 idx = self.fs_combo.findText(text)
             self.fs_combo.setCurrentIndex(idx)
 
-            bs = config.stream.blocksize
+            bs = int(stream["blocksize"])
             for i in range(self.blocksize_combo.count()):
                 if self.blocksize_combo.itemData(i) == bs:
                     self.blocksize_combo.setCurrentIndex(i)
                     break
 
-            lat = config.stream.latency
+            lat = stream["latency"]
             for i in range(self.latency_combo.count()):
                 if self.latency_combo.itemData(i) == lat:
                     self.latency_combo.setCurrentIndex(i)
                     break
 
-            idx = self.dtype_combo.findData(config.stream.dtype)
+            idx = self.dtype_combo.findData(stream["dtype"])
             if idx >= 0:
                 self.dtype_combo.setCurrentIndex(idx)
 
-            self.clip_off_check.setChecked(config.stream.clip_off)
-            self.dither_off_check.setChecked(config.stream.dither_off)
-            self.never_drop_input_check.setChecked(config.stream.never_drop_input)
+            self.clip_off_check.setChecked(bool(stream["clip_off"]))
+            self.dither_off_check.setChecked(bool(stream["dither_off"]))
+            self.never_drop_input_check.setChecked(bool(stream["never_drop_input"]))
             self.prime_check.setChecked(
-                config.stream.prime_output_buffers_using_stream_callback
+                bool(stream["prime_output_buffers_using_stream_callback"])
             )
 
             has_advanced = any(
                 [
                     bs != 0,
                     lat != "high",
-                    config.stream.dtype != "float32",
-                    config.stream.clip_off,
-                    config.stream.dither_off,
-                    config.stream.never_drop_input,
-                    config.stream.prime_output_buffers_using_stream_callback,
+                    stream["dtype"] != "float32",
+                    stream["clip_off"],
+                    stream["dither_off"],
+                    stream["never_drop_input"],
+                    stream["prime_output_buffers_using_stream_callback"],
                 ]
             )
             self.advanced_group.setChecked(bool(has_advanced))
@@ -670,7 +927,8 @@ class DeviceConfigSelector(QDialog):
 
     def _on_test(self) -> None:
         try:
-            test_silent_output(self._collect_config())
+            kwargs = _profile_to_stream_kwargs(self._collect_profile())
+            test_silent_output(kwargs)
         except Exception as exc:
             self.test_button.setText("Test failed")
             self.test_button.setStyleSheet(
@@ -684,7 +942,7 @@ class DeviceConfigSelector(QDialog):
         )
         self.test_button.setToolTip("Output stream opened successfully.")
 
-    def _collect_config(self) -> AudioEngineConfig:
+    def _collect_profile(self) -> dict[str, Any]:
         api_id = self.api_combo.currentData()
         if api_id is None:
             raise RuntimeError("No host API selected")
@@ -699,32 +957,32 @@ class DeviceConfigSelector(QDialog):
         if channels <= 0:
             channels = max_ch
 
-        return AudioEngineConfig(
-            stream=StreamConfig(
-                channels=int(channels),
-                samplerate=float(self.fs_combo.currentText()),
-                blocksize=int(self.blocksize_combo.currentData()),
-                device=device_id,
-                latency=cast(Latency, self.latency_combo.currentData()),
-                dtype=cast(Dtype, self.dtype_combo.currentData()),
-                clip_off=self.clip_off_check.isChecked(),
-                dither_off=self.dither_off_check.isChecked(),
-                never_drop_input=self.never_drop_input_check.isChecked(),
-                prime_output_buffers_using_stream_callback=self.prime_check.isChecked(),
-            ),
-            api=api_name,
-            device_name=self.device_combo.currentText(),
-            exclusive=self.exclusive_check.isChecked()
+        return {
+            "api": api_name,
+            "device_name": self.device_combo.currentText(),
+            "exclusive": self.exclusive_check.isChecked()
             and "WASAPI" in api_name.upper(),
-        )
+            "stream": {
+                "channels": int(channels),
+                "samplerate": float(self.fs_combo.currentText()),
+                "blocksize": int(self.blocksize_combo.currentData()),
+                "device": device_id,
+                "latency": self.latency_combo.currentData(),
+                "dtype": self.dtype_combo.currentData(),
+                "clip_off": self.clip_off_check.isChecked(),
+                "dither_off": self.dither_off_check.isChecked(),
+                "never_drop_input": self.never_drop_input_check.isChecked(),
+                "prime_output_buffers_using_stream_callback": self.prime_check.isChecked(),
+            },
+        }
 
     @staticmethod
     def select(
         config_dir: str | Path | None = None,
         profile: str | None = None,
         parent: QWidget | None = None,
-    ) -> AudioEngineConfig:
-        """Show the dialog modally and return the config.
+    ) -> dict[str, Any]:
+        """Show the dialog modally and return a nested profile dict.
 
         Exits the process with status 0 if the user cancels.
         """
@@ -735,7 +993,7 @@ class DeviceConfigSelector(QDialog):
             parent, config_dir=config_dir, profile=profile
         )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        config = dialog._collect_config() if accepted else None
+        profile_data = dialog._collect_profile() if accepted else None
         dialog.close()
         dialog.deleteLater()
         app.processEvents()
@@ -744,6 +1002,6 @@ class DeviceConfigSelector(QDialog):
         if created_app:
             app.quit()
             app.processEvents()
-        if config is None:
+        if profile_data is None:
             sys.exit(0)
-        return config
+        return profile_data

@@ -1,32 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from threading import Lock
-from typing import Literal, Protocol, TypedDict, Unpack
+from typing import Literal, Self, TypedDict, Unpack
 
 import numpy as np
 import numpy.typing as npt
 import sounddevice as sd
 
-from myio.players import Player
+from myio.players import AudioContext, CallbackTime, Player
 
 AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
 StreamLatency = Literal["low", "high"]
-
-
-class CallbackTime(Protocol):
-    currentTime: float
-    inputBufferAdcTime: float
-    outputBufferDacTime: float
-
-
-@dataclass(frozen=True)
-class AudioContext:
-    frame: int
-    frames: int
-    samplerate: int
-    time: CallbackTime
-    status: sd.CallbackFlags
 
 
 class OutputStreamKwargs(TypedDict, total=False):
@@ -44,7 +28,7 @@ class OutputStreamKwargs(TypedDict, total=False):
 
 
 class AudioEngine:
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Unpack[OutputStreamKwargs]) -> None:
         self._lock = Lock()
         self._players: list[Player] = []
         self._frame: int = 0
@@ -52,21 +36,20 @@ class AudioEngine:
         self.stream = sd.OutputStream(callback=self.callback, **kwargs)
         self.channels: int = self.stream.channels
         self.blocksize: int = self.stream.blocksize
-        self.samplerate: int = self.stream.samplerate
+        self.samplerate: float = self.stream.samplerate
 
     @classmethod
-    def default(cls) -> AudioEngine:
+    def default(cls) -> Self:
         return cls()
 
     @classmethod
-    def from_args(cls, **kwargs: Unpack[OutputStreamKwargs]) -> AudioEngine:
+    def from_args(cls, **kwargs: Unpack[OutputStreamKwargs]) -> Self:
         return cls(**kwargs)
 
     @classmethod
-    def from_dict(cls, config: dict) -> AudioEngine:
+    def from_dict(cls, config: dict | OutputStreamKwargs) -> Self:
+        # TODO: validate config with OutputStreamKwargs
         return cls(**config)
-
-    # TODO: hook up from_file and from selector
 
     def add_player(self, player: Player) -> None:
         with self._lock:
@@ -110,12 +93,8 @@ class AudioEngine:
         )
         with self._lock:
             players = tuple(self._players)
-        try:
-            for player in players:
-                player.mix(buffer, context)
-        except Exception:
-            # TODO: log exception outside audio thread
-            outdata.fill(0)
+        for player in players:
+            player.mix(buffer, context)
 
         outdata[:] = buffer
         self._frame = frame + frames

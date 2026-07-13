@@ -1,27 +1,18 @@
 """myIO — sounddevice AudioEngine with device selection and player mixing."""
 
-from myio.config import (
-    AudioEngineConfig,
-    DeviceResolveError,
-    StreamConfig,
-    list_profiles,
-    profile_path,
-)
-from myio.engine import AudioEngine, Player, AudioContext
-from myio.selector import DeviceConfigSelector
+from myio.engine import AudioEngine, OutputStreamKwargs
+from myio.players import AudioContext, Player
+from myio.selector import DeviceResolveError, select_audio_config
 from myio.utils import dbfs_to_rms, rms_to_dbfs
 
 
 __all__ = [
     "AudioEngine",
-    "AudioEngineConfig",
     "AudioContext",
-    "DeviceConfigSelector",
     "DeviceResolveError",
+    "OutputStreamKwargs",
     "Player",
-    "StreamConfig",
-    "list_profiles",
-    "profile_path",
+    "select_audio_config",
     "dbfs_to_rms",
     "rms_to_dbfs",
 ]
