@@ -14,12 +14,6 @@ Latency = Literal["low", "high"] | float
 PathLike = str | Path
 
 
-def _api_name_for_device(device: int) -> str:
-    info = sd.query_devices(device)
-    name = sd.query_hostapis(int(info["hostapi"]))["name"].lower()
-    return name.replace("windows ", "").replace(" ", "")
-
-
 @dataclass(frozen=True, slots=True)
 class StreamConfig:
     """Parameters that map 1:1 to ``sd.OutputStream`` kwargs."""
@@ -65,20 +59,21 @@ class AudioEngineConfig:
             if isinstance(device, (tuple, list)):
                 device = device[1]
             device = int(device)
+            hostapi = int(sd.query_devices(device)["hostapi"])
             return cls(
                 stream=StreamConfig(
                     samplerate=float(stream.samplerate),
                     device=device,
                     channels=int(stream.channels),
                 ),
-                api=_api_name_for_device(device),
+                api=str(sd.query_hostapis(hostapi)["name"]),
                 exclusive=False,
             )
 
     def stream_kwargs(self) -> dict[str, Any]:
         """Kwargs for ``sd.OutputStream``."""
         kwargs = self.stream.to_dict()
-        if self.exclusive:
+        if self.exclusive and "WASAPI" in self.api.upper():
             kwargs["extra_settings"] = sd.WasapiSettings(exclusive=True)
         return kwargs
 
@@ -91,9 +86,12 @@ class AudioEngineConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AudioEngineConfig:
+        api = data.get("api")
+        if not api:
+            raise ValueError("config missing required field: api")
         return cls(
             stream=StreamConfig.from_dict(dict(data.get("stream") or {})),
-            api=str(data.get("api")),
+            api=str(api),
             exclusive=bool(data.get("exclusive", False)),
         )
 

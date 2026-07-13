@@ -11,7 +11,6 @@ from typing import Any, cast
 
 import numpy as np
 import sounddevice as sd
-from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -58,38 +57,15 @@ def list_channels(api_id: int) -> list[int]:
     return sorted(chans)
 
 
-def list_output_devices(
-    api_id: int | None = None, channels: int | None = None
-) -> list[tuple[int, str, int]]:
+def list_output_devices(api_id: int | None = None) -> list[tuple[int, str, int]]:
     """Return (index, name, max_output_channels) for output devices."""
     out: list[tuple[int, str, int]] = []
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_output_channels"] > 0:
             if api_id is not None and dev["hostapi"] != api_id:
                 continue
-            if channels is not None and dev["max_output_channels"] != channels:
-                continue
             out.append((i, str(dev["name"]), int(dev["max_output_channels"])))
     return out
-
-
-def default_wasapi_index() -> int:
-    """Return the index of the WASAPI host API, or 0 if not found."""
-    for i, a in enumerate(sd.query_hostapis()):
-        if "WASAPI" in a["name"].upper():
-            return i
-    return 0
-
-
-def api_name_for_id(api_id: int) -> str:
-    """Normalize a host API name to match ``AudioEngineConfig.api``."""
-    api_name = sd.query_hostapis(api_id)["name"].lower()
-    return api_name.replace("windows ", "").replace(" ", "")
-
-
-def default_audio_engine_config() -> AudioEngineConfig:
-    """Concrete PortAudio system defaults."""
-    return AudioEngineConfig.default()
 
 
 def test_silent_output(config: AudioEngineConfig, *, duration: float = 0.05) -> None:
@@ -139,7 +115,6 @@ class DeviceConfigSelector(QDialog):
         self._requested_profile = profile
 
         self._build_ui()
-        self._initial_profile_applied = False
 
         if self._config_dir is not None:
             self._refresh_profile_ui(selected=profile)
@@ -272,12 +247,6 @@ class DeviceConfigSelector(QDialog):
         layout.addLayout(button_row)
 
         self._connect_settings_reset()
-
-    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
-        super().showEvent(event)
-        if not self._initial_profile_applied and self._config_dir is not None:
-            self._initial_profile_applied = True
-            self._apply_requested_profile(warn_if_missing=False)
 
     def _apply_requested_profile(self, *, warn_if_missing: bool) -> None:
         """Load ``profile=`` (or the combo selection) into the device form."""
@@ -529,7 +498,7 @@ class DeviceConfigSelector(QDialog):
             api_index = 0
             for i in range(self.api_combo.count()):
                 data = self.api_combo.itemData(i)
-                if data is not None and api_name_for_id(data) == config.api:
+                if data is not None and sd.query_hostapis(data)["name"] == config.api:
                     api_index = i
                     break
             if self.api_combo.currentIndex() == api_index:
@@ -537,7 +506,10 @@ class DeviceConfigSelector(QDialog):
             else:
                 self.api_combo.setCurrentIndex(api_index)
 
-            self.exclusive_check.setChecked(config.exclusive)
+            # Exclusive is WASAPI-only; _on_api_changed clears it for other APIs.
+            self.exclusive_check.setChecked(
+                bool(config.exclusive) and "WASAPI" in config.api.upper()
+            )
 
             device_id = config.stream.device
             found = False
@@ -616,9 +588,9 @@ class DeviceConfigSelector(QDialog):
             self.channels_group.removeButton(btn)
         _clear_layout(self.channels_layout)
 
-        api_name = api_name_for_id(api_id)
-        self.exclusive_check.setEnabled(api_name == "wasapi")
-        if api_name != "wasapi":
+        api_name = str(sd.query_hostapis(api_id)["name"])
+        self.exclusive_check.setEnabled("WASAPI" in api_name.upper())
+        if "WASAPI" not in api_name.upper():
             self.exclusive_check.setChecked(False)
 
         self._channel_values = list_channels(api_id)
@@ -702,7 +674,7 @@ class DeviceConfigSelector(QDialog):
         api_id = self.api_combo.currentData()
         if api_id is None:
             raise RuntimeError("No host API selected")
-        api_name = api_name_for_id(api_id)
+        api_name = str(sd.query_hostapis(api_id)["name"])
 
         dev_data = self.device_combo.currentData()
         if dev_data is None:
@@ -727,13 +699,9 @@ class DeviceConfigSelector(QDialog):
                 prime_output_buffers_using_stream_callback=self.prime_check.isChecked(),
             ),
             api=api_name,
-            exclusive=self.exclusive_check.isChecked(),
+            exclusive=self.exclusive_check.isChecked()
+            and "WASAPI" in api_name.upper(),
         )
-
-    @staticmethod
-    def default() -> AudioEngineConfig:
-        """Concrete PortAudio system defaults without opening the dialog."""
-        return AudioEngineConfig.default()
 
     @staticmethod
     def select(

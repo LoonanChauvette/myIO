@@ -1,5 +1,5 @@
 {
-  "api": "wasapi",
+  "api": "Windows WASAPI",
   "exclusive": false,
   "stream": {
     "samplerate": 48000,

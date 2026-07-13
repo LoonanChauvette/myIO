@@ -1,13 +1,13 @@
 {
-  "api": "wasapi",
+  "api": "Windows WASAPI",
   "exclusive": true,
   "stream": {
-    "samplerate": 96000.0,
+    "samplerate": 48000.0,
     "device": 8,
     "channels": 2,
     "dtype": "float32",
     "blocksize": 0,
-    "latency": "high",
+    "latency": "low",
     "clip_off": false,
     "dither_off": false,
     "never_drop_input": false,

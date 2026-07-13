@@ -9,7 +9,6 @@ import numpy.typing as npt
 import sounddevice as sd
 
 from myio import AudioEngine, AudioEngineConfig
-from myio.players import _Status, _Time
 
 CONFIG_DIR = Path(__file__).resolve().parent / "audioconfigs"
 
@@ -31,8 +30,8 @@ class Tone:
     def mix(
         self,
         outdata: npt.NDArray[np.float32],
-        time: _Time,
-        status: _Status,
+        time: object,
+        status: object,
     ) -> None:
         frames, channels = outdata.shape
         t = (self._phase + np.arange(frames)) / self.samplerate
