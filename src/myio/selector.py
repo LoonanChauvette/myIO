@@ -3,6 +3,7 @@
 ``select_audio_config`` is the public entry point: load a profile JSON or open
 the PySide6 UI, and return flat ``OutputStreamKwargs`` for ``AudioEngine``.
 """
+
 from __future__ import annotations
 
 import json
@@ -56,7 +57,7 @@ def select_audio_config(
     *,
     config_path: PathLike | None = None,
     config_folder: PathLike | None = None,
-    open_ui: bool = False,
+    open_ui: bool = True,
 ) -> OutputStreamKwargs:
     """Return flat stream kwargs for ``AudioEngine`` / ``sd.OutputStream``.
 
@@ -74,9 +75,7 @@ def select_audio_config(
             path = Path(config_path)
             folder = path.parent
             profile = path.stem
-        nested = DeviceConfigSelector.select(
-            config_dir=folder, profile=profile
-        )
+        nested = DeviceConfigSelector.select(config_dir=folder, profile=profile)
         return _profile_to_stream_kwargs(nested)
 
     if config_path is None:
@@ -117,7 +116,9 @@ def _normalize_stream(data: dict[str, Any]) -> dict[str, Any]:
     required = ("samplerate", "device", "channels")
     missing = [k for k in required if k not in stream]
     if missing:
-        raise ValueError(f"stream config missing required field(s): {', '.join(missing)}")
+        raise ValueError(
+            f"stream config missing required field(s): {', '.join(missing)}"
+        )
     stream["samplerate"] = float(stream["samplerate"])
     stream["device"] = int(stream["device"])
     stream["channels"] = int(stream["channels"])
@@ -169,12 +170,12 @@ def _selector_hint(config_path: PathLike | None) -> str:
         path = Path(config_path)
         return (
             "Open the selector to pick a valid device and Save the profile, e.g.\n"
-            "  python -c \"from myio import select_audio_config; "
+            '  python -c "from myio import select_audio_config; '
             f"select_audio_config(config_path=r'{path.as_posix()}', open_ui=True)\""
         )
     return (
         "Open the selector to pick a valid device and Save the profile, e.g.\n"
-        "  python -c \"from myio import select_audio_config; "
+        '  python -c "from myio import select_audio_config; '
         "select_audio_config(config_folder='YOUR_CONFIG_DIR', open_ui=True)\""
     )
 
@@ -224,11 +225,7 @@ def _resolve_profile(
     device = int(stream["device"])
 
     api_id = next(
-        (
-            i
-            for i, host in enumerate(sd.query_hostapis())
-            if host["name"] == api
-        ),
+        (i for i, host in enumerate(sd.query_hostapis()) if host["name"] == api),
         None,
     )
     if api_id is None:
@@ -250,9 +247,7 @@ def _resolve_profile(
 
     if device_name:
         by_name = [
-            (i, name, max_ch)
-            for i, name, max_ch in eligible
-            if name == device_name
+            (i, name, max_ch) for i, name, max_ch in eligible if name == device_name
         ]
         if device in {i for i, _, _ in by_name}:
             return profile
@@ -765,16 +760,18 @@ class DeviceConfigSelector(QDialog):
                 self.api_combo.setCurrentIndex(api_index)
 
             # Exclusive is WASAPI-only; _on_api_changed clears it for other APIs.
-            self.exclusive_check.setChecked(
-                exclusive and "WASAPI" in api.upper()
-            )
+            self.exclusive_check.setChecked(exclusive and "WASAPI" in api.upper())
 
             # Prefer device name (stable across replug); fall back to index.
             device_id = int(stream["device"])
             found = False
             for i in range(self.device_combo.count()):
                 data = self.device_combo.itemData(i)
-                if data and device_name and self.device_combo.itemText(i) == device_name:
+                if (
+                    data
+                    and device_name
+                    and self.device_combo.itemText(i) == device_name
+                ):
                     self.device_combo.setCurrentIndex(i)
                     found = True
                     break
@@ -989,9 +986,7 @@ class DeviceConfigSelector(QDialog):
         created_app = QApplication.instance() is None
         app = QApplication([]) if created_app else QApplication.instance()
         assert app is not None
-        dialog = DeviceConfigSelector(
-            parent, config_dir=config_dir, profile=profile
-        )
+        dialog = DeviceConfigSelector(parent, config_dir=config_dir, profile=profile)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         profile_data = dialog._collect_profile() if accepted else None
         dialog.close()

@@ -2,62 +2,68 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
 import sounddevice as sd
 
-from myio import AudioContext, AudioEngine, select_audio_config
+from myio import AudioContext, AudioEngine, AudioSource, Route, select_audio_config
 
 CONFIG_DIR = Path(__file__).resolve().parent / "audioconfigs"
+TAU = 2 * np.pi
 
 
-class Tone:
+@dataclass
+class Tone(AudioSource):
     """Simple continuous sine player using the engine's mix() API."""
 
-    def __init__(
-        self,
-        frequency: float = 440.0,
-        amplitude: float = 0.2,
-        samplerate: float = 48000.0,
-    ) -> None:
-        self.frequency = frequency
-        self.amplitude = amplitude
-        self.samplerate = samplerate
-        self._phase = 0.0
+    frequency: float = 440.0
+    amplitude: float = 0.2
+    channels: int = 1
+    _phase: float = field(default=0.0, init=False)
+    _phase_increment: float | None = field(default=None, init=False)
 
-    def mix(
-        self,
-        buffer: npt.NDArray[np.float32],
-        context: AudioContext,
-    ) -> None:
-        frames, channels = buffer.shape
-        t = (self._phase + np.arange(frames)) / self.samplerate
-        self._phase += frames
-        mono = (self.amplitude * np.sin(2 * np.pi * self.frequency * t)).astype(
-            np.float32
-        )
-        buffer += np.repeat(mono.reshape(-1, 1), channels, axis=1)
+    def mix(self, buffer: npt.NDArray[np.float32], ctx: AudioContext) -> None:
+
+        if buffer.shape[1] != self.channels:
+            raise ValueError(
+                f"Expected {self.channels} channels, got {buffer.shape[1]}"
+            )
+
+        if self._phase_increment is None:
+            self._phase_increment = TAU * self.frequency / ctx.samplerate
+
+        samples = np.arange(ctx.frames, dtype=np.float32)
+        samples *= self._phase_increment
+        samples += self._phase
+        np.sin(samples, out=samples)
+        samples *= self.amplitude
+
+        buffer += samples[:, None]
+
+        self._phase += ctx.frames * self._phase_increment
+        self._phase %= TAU
 
 
 def main() -> None:
-    # config = select_audio_config(config_folder=CONFIG_DIR, open_ui=True)
-    config = select_audio_config(config_path=CONFIG_DIR / "basic.json")
+
+    config = select_audio_config(config_path=CONFIG_DIR / "basic.json", open_ui=False)
 
     print(f"Using config: {config}")
     engine = AudioEngine.from_dict(config)
-    a = Tone(440.0, amplitude=0.25, samplerate=engine.samplerate)
-    b = Tone(660.0, amplitude=0.12, samplerate=engine.samplerate)
+    a = Tone(1000.0, amplitude=0.24)
+    b = Tone(1100.0, amplitude=0.12)
 
-    engine.add_player(a)
-    engine.add_player(b)
+    engine.add(a, routes=[Route(src=0, dst=0)])
+    engine.add(b, routes=[Route(src=0, dst=1)])
     engine.start()
 
     print(f"Playing @ {engine.samplerate} Hz…")
     try:
         sd.sleep(2000)
-        engine.remove_player(b)
+        engine.remove(b)  # TODO: remove with name instead of handle
         sd.sleep(1000)
     finally:
         engine.stop()

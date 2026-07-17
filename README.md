@@ -13,16 +13,26 @@ uv sync
 ```python
 from myio import AudioEngine, select_audio_config
 
-# Load a saved profile (flat OutputStream kwargs):
-config = select_audio_config(config_path="audioconfigs/default.json")
+# Configure the audio engine with an UI
+config = select_audio_config()
 
-# Or open the UI to pick / save a device:
-# config = select_audio_config(config_folder="audioconfigs", open_ui=True)
+# Or load a saved profile
+config = select_audio_config(config_path="audioconfigs/default.json", open_ui=False)
+
+# Or open the UI to a profile from a config folder:
+config = select_audio_config(config_folder="audioconfigs", open_ui=True)
 
 # Or pass any valid OutputStream kwargs dict:
-# config = {"samplerate": 48000, "channels": 2, "latency": "high"}
+config = {"samplerate": 48000, "channels": 2, "latency": "high"}
 
 engine = AudioEngine.from_dict(config)
+
+# Or simply use the default config
+engine = AudioEngine.default()
+
+# Or simply pass the arguments like you would to sd.OutputStream
+engine = AudioEngine.from_args(samplerate=48000, channels=2, latency="high")
+
 engine.add_player(my_player)
 engine.start()
 # ...
@@ -35,7 +45,24 @@ For PortAudio system defaults with no profile, use `AudioEngine()` / `AudioEngin
 
 ## Players
 
-Implement `mix` and **add into** the buffer (do not replace it):
+```python
+# Binds a player to a specific channel
+player = Player(channels=0)
+
+# Binds a player to multiple channels
+player = Player(channels=[0, 1])
+
+# Binds a player to all available channels
+player = Player(channels="all")
+
+# Bind player to multiple groups of channels (e.g. 7.1 surround)
+player = Player(channels=[[0, 1], [2, 3, 4, 5, 6, 7]])
+
+# Use a dict to have named channel groups
+player = Player(channels={"group1": [1, 2], "group2": [3, 4, 5]})
+```
+
+Players must implement `mix` and **add into** the buffer (do not replace it):
 
 ```python
 class Tone:

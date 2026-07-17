@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
@@ -23,9 +23,10 @@ class AudioContext:
     status: sd.CallbackFlags
 
 
-class Player(Protocol):
-    """Players should implement ``mix`` by adding their audio output into the
-    provided buffer. The buffer is shared with other players, so it should
+@runtime_checkable
+class AudioSource(Protocol):
+    """Audio sources should implement ``mix`` by adding their audio output into the
+    provided buffer. The buffer is shared with other sources, so it should
     not be replaced.
 
     Example::
@@ -36,8 +37,11 @@ class Player(Protocol):
                 buffer += samples
     """
 
+    channels: int
+
     def mix(
         self,
         buffer: npt.NDArray[np.float32],
         context: AudioContext,
+        /,  # means cannot be passed as keyword arguments
     ) -> None: ...
