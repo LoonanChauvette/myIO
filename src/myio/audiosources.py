@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+from myio.keyboard import KeyEvent
 
 import numpy as np
 import numpy.typing as npt
@@ -14,13 +15,14 @@ class CallbackTime(Protocol):
     outputBufferDacTime: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AudioContext:
     frame: int
     frames: int
     samplerate: float
     time: CallbackTime
     status: sd.CallbackFlags
+    events: tuple[KeyEvent, ...] = ()
 
 
 @runtime_checkable

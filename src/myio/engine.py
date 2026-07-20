@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from queue import Empty, SimpleQueue
 from threading import Lock
 from typing import Callable, Literal, Self, TypedDict, Unpack
 
@@ -9,11 +10,13 @@ import numpy.typing as npt
 import sounddevice as sd
 
 from myio.audiosources import AudioContext, AudioSource, CallbackTime
+from myio.keyboard import KeyboardQueue, KeyEvent, normalize_key_name
 
 AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
 StreamLatency = Literal["low", "high"]
 
 
+# Arguments accepted by sounddevice.OutputStream.
 class OutputStreamKwargs(TypedDict, total=False):
     samplerate: float
     blocksize: int
@@ -31,7 +34,7 @@ class OutputStreamKwargs(TypedDict, total=False):
 @dataclass
 class Handle:
     source: AudioSource
-    render: Callable
+    render: Callable[[npt.NDArray[np.float32], AudioContext], None]
     channels: int
     buffer: np.ndarray
     routes: list[Route]
@@ -45,16 +48,24 @@ class Route:
 
 
 class AudioEngine:
+    MAX_BLOCKSIZE: int = 2048
+
     def __init__(self, **kwargs: Unpack[OutputStreamKwargs]) -> None:
-        self._lock = Lock()
-        self._handles: list[Handle] = []
+        self._stream_kwargs: OutputStreamKwargs = kwargs
+        self._stream: sd.OutputStream | None = None
+
+        self._render_lock: Lock = Lock()  # Protects anything touching the callback
+        self._engine_lock: Lock = Lock()
+        self._handles: tuple[Handle, ...] = tuple()
         self._frame: int = 0
 
-        self.MAX_BLOCKSIZE = 2048
-        self.stream = sd.OutputStream(callback=self.callback, **kwargs)
-        self.channels: int = self.stream.channels
-        self.blocksize: int = self.stream.blocksize
-        self.samplerate: float = self.stream.samplerate
+        self._keys: set[str] = set()
+        self._event_queue: SimpleQueue[KeyEvent] = SimpleQueue()
+        self._keyboard: KeyboardQueue | None = None
+
+        self.channels: int = int(kwargs.get("channels", 0))
+        self.blocksize: int = int(kwargs.get("blocksize", 0))
+        self.samplerate: float = float(kwargs.get("samplerate", 0.0))
 
     @classmethod
     def default(cls) -> Self:
@@ -71,42 +82,118 @@ class AudioEngine:
 
     def add(self, source: AudioSource, routes: list[Route]) -> Handle:
         # TODO: default routes to all dst channels
-        blocksize = self.blocksize if self.blocksize != 0 else self.MAX_BLOCKSIZE
         handle = Handle(
             source=source,
             render=source.mix,
             channels=source.channels,
-            buffer=np.empty((blocksize, source.channels), dtype=np.float32),
+            buffer=np.empty((self.MAX_BLOCKSIZE, source.channels), dtype=np.float32),
             routes=routes,
         )
 
-        with self._lock:
-            self._handles.append(handle)
+        with self._engine_lock:
+            # handles are stored as an immutable tuple (better for the render loop)
+            # but means we need to reconstruct the tuple on each update
+            self._handles = tuple((*self._handles, handle))
         return handle
 
     def get_handle(self, source: AudioSource) -> Handle:
+        """Retrieve the handle associated with an audio source."""
         for handle in self._handles:
             if handle.source is source:
                 return handle
         raise ValueError(f"Could not remove sound source {source} : Player not found")
 
     def remove(self, item: Handle | AudioSource) -> None:
-        with self._lock:
-            handle = item if isinstance(item, Handle) else self.get_handle(item)
-            self._handles.remove(handle)
+        with self._render_lock:
+            if isinstance(item, AudioSource):
+                handle = self.get_handle(item)
+            elif isinstance(item, Handle):
+                handle = item
+            self._handles = tuple(h for h in self._handles if h != handle)
+
+    def listen(self, key: str) -> None:
+        """Register a keyboard key"""
+        name = normalize_key_name(key)
+        with self._engine_lock:
+            if self._stream is not None:
+                raise RuntimeError("Cannot register keys while the engine is running")
+            self._keys.add(name)
 
     def start(self) -> None:
-        if not self.stream.active:
-            self.stream.start()
+        with self._engine_lock:
+            if self._stream is not None:
+                return
+
+            self._frame = 0
+            try:
+                self._start_keyboard()
+                self._start_stream()
+
+            except Exception:
+                self._cleanup_resources()
+                raise
 
     def stop(self) -> None:
-        if self.stream.active:
-            self.stream.stop()
+        self._cleanup_resources()
 
     def close(self) -> None:
-        if self.stream.active:
-            self.stream.stop()
-        self.stream.close()
+        self.stop()
+
+    def _start_stream(self) -> None:
+        stream = sd.OutputStream(callback=self.callback, **self._stream_kwargs)
+        self._stream = stream
+        self.channels = int(stream.channels)
+        self.blocksize = int(stream.blocksize)
+        self.samplerate = float(stream.samplerate)
+        stream.start()
+
+    def _start_keyboard(self) -> None:
+        if not self._keys:
+            return
+
+        self._keyboard = KeyboardQueue(self._keys, self._event_queue)
+        self._keyboard.start()
+
+    def _cleanup_resources(self) -> None:
+
+        with self._engine_lock:  # Detaches resources
+            stream, self._stream = self._stream, None
+            keyboard, self._keyboard = self._keyboard, None
+
+        if stream is not None:
+            self._close_stream(stream)
+
+        if keyboard is not None:
+            keyboard.stop()
+
+        self._clear_queue()
+
+    def _close_stream(self, stream: sd.OutputStream) -> None:
+        if stream.active:
+            stream.stop()
+        stream.close()
+
+    def _clear_queue(self) -> None:
+        while True:
+            try:
+                self._event_queue.get_nowait()
+            except Empty:
+                return
+
+    def _read_events(self, time: CallbackTime) -> tuple[KeyEvent, ...]:
+        events: list[KeyEvent] = []
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except Empty:
+                break
+
+            offset = event.timestamp - time.outputBufferDacTime
+            local_sample = offset * self.samplerate
+            event.sample = self._frame + int(round(local_sample))
+            events.append(event)
+
+        return tuple(events)
 
     def callback(
         self,
@@ -116,20 +203,20 @@ class AudioEngine:
         status: sd.CallbackFlags,
     ) -> None:
 
-        outdata.fill(0)  # Empty the output buffer
+        outdata.fill(0)
         context = AudioContext(
             frame=self._frame,
             frames=frames,
             samplerate=self.samplerate,
             time=time,
             status=status,
+            events=self._read_events(time),
         )
-        with self._lock:
-            handles = tuple(self._handles)
 
+        handles = self._handles
         for handle in handles:
             assert handle.buffer.shape[0] >= frames, (
-                f"buffer shape {handle.buffer.shape} does not match frames {frames}"
+                f"buffer shape {handle.buffer.shape} is too small for frames {frames}"
             )
             buffer = handle.buffer[:frames]
             buffer.fill(0)

@@ -24,13 +24,22 @@ class Tone(AudioSource):
     channels: int = 1
     _phase: float = field(default=0.0, init=False)
     _phase_increment: float | None = field(default=None, init=False)
+    _playing: bool = field(default=True, init=False)
 
     def mix(self, buffer: npt.NDArray[np.float32], ctx: AudioContext) -> None:
-
         if buffer.shape[1] != self.channels:
             raise ValueError(
                 f"Expected {self.channels} channels, got {buffer.shape[1]}"
             )
+
+        for event in ctx.events:
+            if event.pressed and event.key == "space":
+                self._playing = not self._playing
+            elif event.pressed and event.key == "escape":
+                self._playing = False
+
+        if not self._playing:
+            return
 
         if self._phase_increment is None:
             self._phase_increment = TAU * self.frequency / ctx.samplerate
@@ -48,11 +57,11 @@ class Tone(AudioSource):
 
 
 def main() -> None:
-
     config = select_audio_config(config_path=CONFIG_DIR / "basic.json", open_ui=False)
-
-    print(f"Using config: {config}")
     engine = AudioEngine.from_dict(config)
+    engine.listen("space")
+    engine.listen("escape")
+
     a = Tone(1000.0, amplitude=0.24)
     b = Tone(1100.0, amplitude=0.12)
 
@@ -63,10 +72,12 @@ def main() -> None:
     print(f"Playing @ {engine.samplerate} Hz…")
     try:
         sd.sleep(2000)
-        engine.remove(b)  # TODO: remove with name instead of handle
+        engine.remove(b)
         sd.sleep(1000)
     finally:
+        print("stopping engine")
         engine.stop()
+        print("engine stopped")
     print("Done.")
 
 
