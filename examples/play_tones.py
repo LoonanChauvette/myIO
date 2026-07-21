@@ -33,10 +33,10 @@ class Tone(AudioSource):
             )
 
         for event in ctx.events:
-            if event.pressed and event.key == "space":
-                self._playing = not self._playing
-            elif event.pressed and event.key == "escape":
-                self._playing = False
+           if event.pressed and event.key == "space":
+               self._playing = not self._playing
+           elif event.pressed and event.key == "escape":
+               self._playing = False
 
         if not self._playing:
             return

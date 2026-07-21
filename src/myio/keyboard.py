@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from threading import Thread
+from time import sleep
 from typing import Iterator, TypedDict
 
 import numpy as np
@@ -158,7 +159,6 @@ class KeyEvent:
 
 
 class KeyboardQueue:
-    _POLL_TIMEOUT_S: float = 0.05
 
     def __init__(self, keys: set[str]) -> None:
         """
@@ -259,8 +259,7 @@ class KeyboardQueue:
         """
         try:
             while not self.is_stopped():
-                # If no HID event is available, wait briefly for the next event, then loops
-                hid_event = self._hid_get_event(self._POLL_TIMEOUT_S)
+                hid_event = self._hid_get_event(0.0)
 
                 # If a HID event is available, convert it to KeyEvent and put it on the queue
                 while hid_event is not None:
@@ -270,6 +269,9 @@ class KeyboardQueue:
 
                     # Drain any other already-queued HID events without blocking
                     hid_event = self._hid_get_event(0.0)
+
+                # Release the GIL so the audio callback can run.
+                sleep(0.001)
         except BaseException as error:
             self._error = error
             self._stopped = True
