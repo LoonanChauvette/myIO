@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
+from typing import Iterator
 from unittest.mock import patch
 
 import numpy as np
 import sounddevice as sd
 
 from myio import AudioContext, AudioEngine, Route
-from myio.keyboard import _RawKeyEvent
+from myio.keyboard import KeyEvent
 
 
 @dataclass
@@ -54,6 +55,8 @@ class FakeKeyboard:
         self.keys = keys
         self.started = False
         self.stopped = False
+        self._events: list[KeyEvent] = []
+        self._error: BaseException | None = None
         self.instances.append(self)
 
     def start(self) -> None:
@@ -62,8 +65,14 @@ class FakeKeyboard:
     def stop(self) -> None:
         self.stopped = True
 
-    def poll(self) -> list[_RawKeyEvent]:
-        return []
+    @property
+    def pending_events(self) -> Iterator[KeyEvent]:
+        while self._events:
+            yield self._events.pop(0)
+
+    @property
+    def error(self) -> BaseException | None:
+        return self._error
 
 
 class EngineInputTests(unittest.TestCase):
@@ -80,7 +89,10 @@ class EngineInputTests(unittest.TestCase):
         engine = AudioEngine(samplerate=48_000, channels=1, blocksize=64)
         source = CapturingSource()
         engine.add(source, [Route()])
-        engine._event_queue.put(_RawKeyEvent("space", True, 100.0015, 32))
+
+        keyboard = FakeKeyboard({"space"})
+        keyboard._events.append(KeyEvent("space", True, 100.0015, 32))
+        engine._keyboard = keyboard
 
         output = np.empty((64, 1), dtype=np.float32)
         engine.callback(output, 64, FakeTime(), sd.CallbackFlags())
@@ -92,10 +104,22 @@ class EngineInputTests(unittest.TestCase):
         self.assertEqual(event.sample, 72)
         self.assertEqual(event.timestamp, 100.0015)
 
+    def test_callback_raises_when_keyboard_worker_failed(self) -> None:
+        engine = AudioEngine(samplerate=48_000, channels=1, blocksize=64)
+        source = CapturingSource()
+        engine.add(source, [Route()])
+
+        keyboard = FakeKeyboard({"space"})
+        keyboard._error = RuntimeError("hid boom")
+        engine._keyboard = keyboard
+
+        output = np.empty((64, 1), dtype=np.float32)
+        with self.assertRaisesRegex(RuntimeError, "Keyboard worker failed"):
+            engine.callback(output, 64, FakeTime(), sd.CallbackFlags())
+
     def test_start_and_stop_own_keyboard_and_stream(self) -> None:
         with (
-            patch("myio.engine._KeyboardQueue", FakeKeyboard),
-            patch("myio.engine.GetSecs", return_value=1.0),
+            patch("myio.engine.KeyboardQueue", FakeKeyboard),
             patch("myio.engine.sd.OutputStream", FakeStream),
         ):
             engine = AudioEngine(samplerate=48_000, channels=2, blocksize=64)
@@ -117,7 +141,7 @@ class EngineInputTests(unittest.TestCase):
 
     def test_audio_only_start_does_not_create_keyboard(self) -> None:
         with (
-            patch("myio.engine._KeyboardQueue", FakeKeyboard),
+            patch("myio.engine.KeyboardQueue", FakeKeyboard),
             patch("myio.engine.sd.OutputStream", FakeStream),
         ):
             engine = AudioEngine(samplerate=48_000, channels=2, blocksize=64)
@@ -128,8 +152,7 @@ class EngineInputTests(unittest.TestCase):
 
     def test_audio_start_failure_releases_keyboard(self) -> None:
         with (
-            patch("myio.engine._KeyboardQueue", FakeKeyboard),
-            patch("myio.engine.GetSecs", return_value=1.0),
+            patch("myio.engine.KeyboardQueue", FakeKeyboard),
             patch(
                 "myio.engine.sd.OutputStream",
                 side_effect=RuntimeError("audio unavailable"),

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from queue import Empty, SimpleQueue
 from threading import Lock
 from typing import Callable, Literal, Self, TypedDict, Unpack
 
@@ -60,7 +59,6 @@ class AudioEngine:
         self._frame: int = 0
 
         self._keys: set[str] = set()
-        self._event_queue: SimpleQueue[KeyEvent] = SimpleQueue()
         self._keyboard: KeyboardQueue | None = None
 
         self.channels: int = int(kwargs.get("channels", 0))
@@ -112,7 +110,6 @@ class AudioEngine:
             self._handles = tuple(h for h in self._handles if h != handle)
 
     def listen(self, key: str) -> None:
-        """Register a keyboard key"""
         name = normalize_key_name(key)
         with self._engine_lock:
             if self._stream is not None:
@@ -128,16 +125,22 @@ class AudioEngine:
             try:
                 self._start_keyboard()
                 self._start_stream()
+                return
+            except Exception as exc:
+                stream, self._stream = self._stream, None
+                keyboard, self._keyboard = self._keyboard, None
+                error = exc
 
-            except Exception:
-                self._cleanup_resources()
-                raise
+        self._close_stream(stream)
+        if keyboard is not None:
+            keyboard.stop()
+        raise error
 
     def stop(self) -> None:
         self._cleanup_resources()
 
     def close(self) -> None:
-        self.stop()
+        self._cleanup_resources()
 
     def _start_stream(self) -> None:
         stream = sd.OutputStream(callback=self.callback, **self._stream_kwargs)
@@ -151,43 +154,35 @@ class AudioEngine:
         if not self._keys:
             return
 
-        self._keyboard = KeyboardQueue(self._keys, self._event_queue)
+        self._keyboard = KeyboardQueue(self._keys)
         self._keyboard.start()
 
     def _cleanup_resources(self) -> None:
-
-        with self._engine_lock:  # Detaches resources
+        with self._engine_lock:
             stream, self._stream = self._stream, None
             keyboard, self._keyboard = self._keyboard, None
 
-        if stream is not None:
-            self._close_stream(stream)
-
+        self._close_stream(stream)
         if keyboard is not None:
             keyboard.stop()
 
-        self._clear_queue()
-
-    def _close_stream(self, stream: sd.OutputStream) -> None:
+    def _close_stream(self, stream: sd.OutputStream | None) -> None:
+        if stream is None:
+            return
         if stream.active:
             stream.stop()
         stream.close()
 
-    def _clear_queue(self) -> None:
-        while True:
-            try:
-                self._event_queue.get_nowait()
-            except Empty:
-                return
+    def _drain_pending_events(self, time: CallbackTime) -> tuple[KeyEvent, ...]:
+        keyboard = self._keyboard
+        if keyboard is None:
+            return ()
 
-    def _read_events(self, time: CallbackTime) -> tuple[KeyEvent, ...]:
+        if keyboard.error is not None:
+            raise RuntimeError("Keyboard worker failed") from keyboard.error
+
         events: list[KeyEvent] = []
-        while True:
-            try:
-                event = self._event_queue.get_nowait()
-            except Empty:
-                break
-
+        for event in keyboard.pending_events:
             offset = event.timestamp - time.outputBufferDacTime
             local_sample = offset * self.samplerate
             event.sample = self._frame + int(round(local_sample))
@@ -210,17 +205,15 @@ class AudioEngine:
             samplerate=self.samplerate,
             time=time,
             status=status,
-            events=self._read_events(time),
+            events=self._drain_pending_events(time),
         )
 
         handles = self._handles
         for handle in handles:
-            assert handle.buffer.shape[0] >= frames, (
-                f"buffer shape {handle.buffer.shape} is too small for frames {frames}"
-            )
             buffer = handle.buffer[:frames]
             buffer.fill(0)
             handle.render(buffer, context)
+
             for route in handle.routes:
                 outdata[:, route.dst] += route.gain * buffer[:, route.src]
 

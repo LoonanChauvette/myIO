@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from queue import SimpleQueue
-from threading import Event, Thread
+from queue import Empty, SimpleQueue
+from threading import Thread
 from typing import Iterator, TypedDict
 
 import numpy as np
@@ -151,16 +151,16 @@ def resolve_key(key: str) -> tuple[int, ...]:
 @dataclass(slots=True)
 class KeyEvent:
     key: str  # Normalized virtual key name
-    pressed: bool  # True if the key is pressed, False otherwise
+    pressed: bool  # True for press events, False for release events
     timestamp: float  # Time of the event in seconds
-    raw_code: int  # DirectInput scan codes (one-based)
+    raw_code: int  # DirectInput scan code (one-based)
     sample: int | None = None  # Sample number at the time of the event (set by engine)
 
 
 class KeyboardQueue:
-    """Small lifecycle wrapper around the PsychHID keyboard queue."""
+    _POLL_TIMEOUT_S: float = 0.05
 
-    def __init__(self, keys: set[str], event_queue: SimpleQueue[KeyEvent]) -> None:
+    def __init__(self, keys: set[str]) -> None:
         """
         Initialize the keyboard queue with the requested keys.
 
@@ -169,82 +169,110 @@ class KeyboardQueue:
 
         Example:
             >>> keys = {"space", "escape", "a", "shift"}
-            >>> keyboard = _KeyboardQueue(keys)
+            >>> keyboard = KeyboardQueue(keys)
             >>> keyboard._code_names
             {27: 'escape', 32: 'space', 65: 'a', 160: 'shift', 161: 'shift'}
         """
-        self._code_names: dict[int, str] = {}
+        # Reverse lookup to convert PsychHID integer codes back to logical names.
+        self._code_names: dict[int, str] = {
+            code: key for key in sorted(keys) for code in resolve_key(key)
+        }
+
         self._started: bool = False
-
-        self._event_queue: SimpleQueue[KeyEvent] = event_queue
-        self._thread: Thread | None = None
-        self._stop: Event = Event()
+        self._stopped: bool = False
         self._error: BaseException | None = None
+        self._queue: SimpleQueue[KeyEvent] = SimpleQueue()
+        self._thread: Thread = Thread(target=self._worker, daemon=True)
 
-        # Reverse lookup used to convert PsychHID integer codes back to logical names.
-        for key in sorted(keys):
-            for code in resolve_key(key):
-                self._code_names[code] = key
+    @property
+    def pending_events(self) -> Iterator[KeyEvent]:
+        """
+        Allows iterating over pending events, draining the queue.
+            >>> for event in keyboard.pending_events:
+            ...     print(event)
+
+        Also allows draining the queue by iterating over this property.
+            >>> for _ in self.pending_events:
+            ...     pass
+        """
+        while True:
+            try:
+                yield self._queue.get_nowait()
+            except Empty:
+                return
+
+    @property
+    def error(self) -> BaseException | None:
+        """Exception raised by the worker thread, if it has failed."""
+        return self._error
+
+    def is_started(self) -> bool:
+        return self._started
+
+    def is_stopped(self) -> bool:
+        return self._stopped
 
     def start(self) -> None:
         """
         Start the PsychHID keyboard queue.
-
-        The requested key names are converted into a PsychHID key mask.
-        PsychHID uses one-based keycode indexing internally,
-        Python uses zero-based indexing, so mask keycodes are shifted by one.
+        Starts a worker thread to bridge PsychHID -> SimpleQueue.
         """
-        if self._started:
+        if self.is_started():
             raise RuntimeError("Keyboard queue already started")
+        if self.is_stopped():
+            raise RuntimeError("KeyboardQueue cannot be restarted once stopped")
 
+        # Converts requested key to PsychHID key mask
         mask = [0] * 256
         for code in self._code_names:
-            mask[code - 1] = 1
+            mask[code - 1] = 1  # PsychHID one-based keycode -> zero-based mask index
 
+        PsychHID("KbQueueCreate", None, mask, 0, 10_000, 0, None)
         try:
-            self._create_queue(mask)
-            self._start_queue()
+            PsychHID("KbQueueStart", None)
             GetSecs()  # Warm up Psychtoolbox's high-resolution Windows clock.
-            self._thread = Thread(
-                target=self._worker, name="myio-keyboard", daemon=True
-            )
             self._thread.start()
             self._started = True
         except Exception:
-            self._release_queue()
+            PsychHID("KbQueueRelease", None)
             raise
 
     def stop(self) -> None:
-        if not self._started:
+        if not self.is_started():
             return
 
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
+        self._stopped = True
+        self._started = False
+        self._thread.join()
 
         try:
-            self._stop_queue()
+            PsychHID("KbQueueStop", None)
         finally:
-            self._release_queue()
-            self._started = False
+            PsychHID("KbQueueRelease", None)
+            for _ in self.pending_events:
+                pass
 
-    def poll(self) -> list[KeyEvent]:
-        events: list[KeyEvent] = []
+    def _worker(self) -> None:
+        """
+        Bridges PsychHID into a queue the audio callback can drain:
+        PsychHID -> SimpleQueue -> AudioCallback (callback never calls PsychHID directly).
+        """
+        try:
+            while not self.is_stopped():
+                # If no HID event is available, wait briefly for the next event, then loops
+                hid_event = self._hid_get_event(self._POLL_TIMEOUT_S)
 
-        for raw in self._iter_queue():
-            event = self._to_key_event(raw)
-            if event is not None:
-                events.append(event)
+                # If a HID event is available, convert it to KeyEvent and put it on the queue
+                while hid_event is not None:
+                    key_event = self._to_key_event(hid_event)
+                    if key_event is not None:
+                        self._queue.put(key_event)
 
-        return events
-
-    def _iter_queue(self) -> Iterator[PsychHIDEvent]:
-        while True:
-            event = self._get_event_from_queue()
-            if event is None:
-                break
-
-            yield event
+                    # Drain any other already-queued HID events without blocking
+                    hid_event = self._hid_get_event(0.0)
+        except BaseException as error:
+            self._error = error
+            self._stopped = True
 
     def _to_key_event(self, raw: PsychHIDEvent) -> KeyEvent | None:
         is_keypress = int(raw["Type"]) == 0
@@ -263,61 +291,20 @@ class KeyboardQueue:
             raw_code=raw_code,
         )
 
-    def _worker(self) -> None:
-        try:
-            while not self._stop.is_set():
-                for event in self.poll():
-                    self._event_queue.put(event)
-                self._stop.wait(0.001)
-        except BaseException as error:
-            self._error = error
-            self._stop.set()
-
-    def _create_queue(self, mask: list[int]) -> None:
-        """Wrapper around PsychHID('KbQueueCreate'): psychtoolbox.org/docs/PsychHID-KbQueueCreate"""
-        PsychHID("KbQueueCreate", None, mask, 0, 10_000, 0, None)
-
-    def _start_queue(self) -> None:
-        """Wrapper for PsychHID('KbQueueStart'): psychtoolbox.org/docs/PsychHID-KbQueueStart"""
-        PsychHID("KbQueueStart", None)
-
-    def _release_queue(self) -> None:
-        """Wrapper for PsychHID('KbQueueRelease'): psychtoolbox.org/docs/PsychHID-KbQueueRelease"""
-        PsychHID("KbQueueRelease", None)
-
-    def _stop_queue(self) -> None:
-        """Wrapper for PsychHID('KbQueueStop'): psychtoolbox.org/docs/PsychHID-KbQueueStop"""
-        PsychHID("KbQueueStop", None)
-
-    def _get_available_events(self) -> int:
-        """Wrapper for PsychHID('KbQueueFlush'): http://psychtoolbox.org/docs/PsychHID-KbQueueFlush"""
-        n_avail = PsychHID("KbQueueFlush", None, 0)
-        return int(n_avail)
-
-    def _get_event_from_queue(self, max_wait_time: float = 0.0) -> PsychHIDEvent | None:
-        """Wrapper for PsychHID('KbQueueGetEvent'): psychtoolbox.org/docs/PsychHID-KbQueueGetEvent"""
+    def _hid_get_event(self, max_wait_time: float = 0.0) -> PsychHIDEvent | None:
+        """KbQueueGetEvent: waits only when the HID queue is empty and max_wait_time > 0."""
         raw, _ = PsychHID("KbQueueGetEvent", None, max_wait_time)
         return raw if isinstance(raw, dict) else None
-
-    def _clear_queue(self) -> None:
-        """Wrapper for PsychHID('KbQueueFlush'): http://psychtoolbox.org/docs/PsychHID-KbQueueFlush"""
-        PsychHID("KbQueueFlush", None, 3)
 
 
 if __name__ == "__main__":
     import time
 
     keys = {"space", "escape", "a", "shift"}
-    queue = SimpleQueue()
-    keyboard = KeyboardQueue(keys, queue)
+    keyboard = KeyboardQueue(keys)
     keyboard.start()
 
     while True:
-        try:
-            raw = queue.get_nowait()
-            if raw is not None:
-                print(raw)
-        except Exception:
-            pass
-
+        for event in keyboard.pending_events:
+            print(event)
         time.sleep(0.01)
