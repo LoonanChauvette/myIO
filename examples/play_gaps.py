@@ -73,6 +73,7 @@ class GappedTone(AudioSource):
             self._init_dsp(ctx.samplerate)
 
         frames = ctx.frames
+        frame = ctx.clock.frame
         sr = ctx.samplerate
         assert self._phase_increment is not None
         assert self._noise_sos is not None
@@ -86,12 +87,12 @@ class GappedTone(AudioSource):
         self._phase = float((phase[-1] + self._phase_increment) % TAU)
 
         # ---- Equal noise / tone windows ----
-        segment_samples = max(1, int(round(self.segment_duration * sr)))
-        ramp_samples = max(0, int(round(self.ramp_duration * sr)))
+        segment_samples = max(1, round(self.segment_duration * sr))
+        ramp_samples = max(0, round(self.ramp_duration * sr))
         ramp_samples = min(ramp_samples, segment_samples // 2)
 
         period_samples = 2 * segment_samples
-        sample_index = (ctx.frame + np.arange(frames)) % period_samples
+        sample_index = (frame + np.arange(frames)) % period_samples
 
         # First half: noise (tone off). Second half: tone (noise off).
         in_noise = sample_index < segment_samples
@@ -200,9 +201,7 @@ def main() -> None:
     engine.start()
 
     print(f"Playing @ {engine.samplerate} Hz…")
-    print(
-        "Controls: Up/Down SNR  Left/Right segment  Space continuous  Escape quit"
-    )
+    print("Controls: Up/Down SNR  Left/Right segment  Space continuous  Escape quit")
     print(stimulus.status_line())
     stimulus._status_dirty = False
 

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from queue import SimpleQueue
 from threading import Lock
-from typing import Callable, Literal, Self, TypedDict, Unpack
+from typing import Literal, Self, TypedDict, Unpack
 
 import numpy as np
 import numpy.typing as npt
 import sounddevice as sd
 
-from myio.audiosources import AudioContext, AudioSource, CallbackTime
+from myio.audiosources import AudioContext, AudioSource
+from myio.clock import CallbackTime, Clock
 from myio.keyboard import KeyboardQueue, KeyEvent, normalize_key_name
 
 AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
@@ -50,20 +53,22 @@ class AudioEngine:
     MAX_BLOCKSIZE: int = 2048
 
     def __init__(self, **kwargs: Unpack[OutputStreamKwargs]) -> None:
-        self._stream_kwargs: OutputStreamKwargs = kwargs
-        self._stream: sd.OutputStream | None = None
+        self.stream: sd.OutputStream = self.init_stream(kwargs)
+        self.channels: int = int(self.stream.channels)
+        self.blocksize: int = int(self.stream.blocksize)
+        self.samplerate: float = float(self.stream.samplerate)
 
-        self._render_lock: Lock = Lock()  # Protects anything touching the callback
+        print(
+            f"Stream started with {self.channels} channels, {self.blocksize} blocksize, {self.samplerate} samplerate"
+        )
+
+        self.clock: Clock = Clock(self.samplerate, self.blocksize)
+
         self._engine_lock: Lock = Lock()
-        self._handles: tuple[Handle, ...] = tuple()
-        self._frame: int = 0
+        self._handles: tuple[Handle, ...] = ()
 
-        self._keys: set[str] = set()
-        self._keyboard: KeyboardQueue | None = None
-
-        self.channels: int = int(kwargs.get("channels", 0))
-        self.blocksize: int = int(kwargs.get("blocksize", 0))
-        self.samplerate: float = float(kwargs.get("samplerate", 0.0))
+        self.event_queue: SimpleQueue = SimpleQueue()
+        self.keyboard: KeyboardQueue = KeyboardQueue(self.event_queue)
 
     @classmethod
     def default(cls) -> Self:
@@ -78,6 +83,13 @@ class AudioEngine:
         # TODO: validate config with OutputStreamKwargs
         return cls(**config)
 
+    def init_stream(self, kwargs: OutputStreamKwargs) -> sd.OutputStream:
+        try:
+            stream = sd.OutputStream(callback=self.callback, **kwargs)
+            return stream
+        except Exception as e:
+            raise RuntimeError("Failed to start stream") from e
+
     def add(self, source: AudioSource, routes: list[Route]) -> Handle:
         # TODO: default routes to all dst channels
         handle = Handle(
@@ -91,7 +103,7 @@ class AudioEngine:
         with self._engine_lock:
             # handles are stored as an immutable tuple (better for the render loop)
             # but means we need to reconstruct the tuple on each update
-            self._handles = tuple((*self._handles, handle))
+            self._handles = (*self._handles, handle)
         return handle
 
     def get_handle(self, source: AudioSource) -> Handle:
@@ -102,7 +114,7 @@ class AudioEngine:
         raise ValueError(f"Could not remove sound source {source} : Player not found")
 
     def remove(self, item: Handle | AudioSource) -> None:
-        with self._render_lock:
+        with self._engine_lock:
             if isinstance(item, AudioSource):
                 handle = self.get_handle(item)
             elif isinstance(item, Handle):
@@ -112,71 +124,29 @@ class AudioEngine:
     def listen(self, key: str) -> None:
         name = normalize_key_name(key)
         with self._engine_lock:
-            if self._stream is not None:
+            if self.stream.active:
                 raise RuntimeError("Cannot register keys while the engine is running")
-            self._keys.add(name)
+            self.keyboard.add_keys({name})
 
     def start(self) -> None:
         with self._engine_lock:
-            if self._stream is not None:
-                return
-
-            self._frame = 0
             try:
-                self._start_keyboard()
-                self._start_stream()
+                self.keyboard.start()
+                self.stream.start()
                 return
             except Exception as exc:
-                stream, self._stream = self._stream, None
-                keyboard, self._keyboard = self._keyboard, None
-                error = exc
-
-        self._close_stream(stream)
-        if keyboard is not None:
-            keyboard.stop()
-        raise error
+                self.stop()
+                raise RuntimeError("Failed to start the engine") from exc
 
     def stop(self) -> None:
-        self._cleanup_resources()
-
-    def close(self) -> None:
-        self._cleanup_resources()
-
-    def _start_stream(self) -> None:
-        stream = sd.OutputStream(callback=self.callback, **self._stream_kwargs)
-        self._stream = stream
-        self.channels = int(stream.channels)
-        self.blocksize = int(stream.blocksize)
-        self.samplerate = float(stream.samplerate)
-        stream.start()
-
-    def _start_keyboard(self) -> None:
-        if not self._keys:
-            return
-
-        self._keyboard = KeyboardQueue(self._keys)
-        self._keyboard.start()
-
-    def _cleanup_resources(self) -> None:
         with self._engine_lock:
-            stream, self._stream = self._stream, None
-            keyboard, self._keyboard = self._keyboard, None
-
-        self._close_stream(stream)
-        if keyboard is not None:
-            keyboard.stop()
-
-    def _close_stream(self, stream: sd.OutputStream | None) -> None:
-        if stream is None:
-            return
-        if stream.active:
-            stream.stop()
-        stream.close()
+            if self.stream.active:
+                self.stream.stop()
+            self.stream.close()
+            self.keyboard.stop()
 
     def _drain_pending_events(self, time: CallbackTime) -> tuple[KeyEvent, ...]:
-        keyboard = self._keyboard
-        if keyboard is None:
-            return ()
+        keyboard = self.keyboard
 
         if keyboard.error is not None:
             raise RuntimeError("Keyboard worker failed") from keyboard.error
@@ -185,26 +155,24 @@ class AudioEngine:
         for event in keyboard.pending_events:
             offset = event.timestamp - time.outputBufferDacTime
             local_sample = offset * self.samplerate
-            event.sample = self._frame + int(round(local_sample))
+            event.sample = self.clock.frame + round(local_sample)
             events.append(event)
 
         return tuple(events)
 
-    def callback(
-        self,
-        outdata: npt.NDArray[np.float32],
-        frames: int,
-        time: CallbackTime,
-        status: sd.CallbackFlags,
+    def render(
+        self, outdata: npt.NDArray[np.float32], frames: int, time: CallbackTime
     ) -> None:
 
         outdata.fill(0)
+
+        clock = self.clock
+        clock.tick(frames, time)
+
         context = AudioContext(
-            frame=self._frame,
             frames=frames,
             samplerate=self.samplerate,
-            time=time,
-            status=status,
+            clock=clock,
             events=self._drain_pending_events(time),
         )
 
@@ -217,4 +185,11 @@ class AudioEngine:
             for route in handle.routes:
                 outdata[:, route.dst] += route.gain * buffer[:, route.src]
 
-        self._frame += frames
+    def callback(
+        self,
+        outdata: npt.NDArray[np.float32],
+        frames: int,
+        time: CallbackTime,
+        status: sd.CallbackFlags,
+    ) -> None:
+        self.render(outdata, frames, time)

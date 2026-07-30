@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from threading import Thread
 from time import sleep
-from typing import Iterator, TypedDict
+from typing import TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -159,29 +160,22 @@ class KeyEvent:
 
 
 class KeyboardQueue:
-
-    def __init__(self, keys: set[str]) -> None:
+    def __init__(self, queue: SimpleQueue) -> None:
         """
         Initialize the keyboard queue with the requested keys.
 
         The constructor creates an internal reverse lookup table mapping
         PsychHID key codes to logical key names.
-
-        Example:
-            >>> keys = {"space", "escape", "a", "shift"}
-            >>> keyboard = KeyboardQueue(keys)
-            >>> keyboard._code_names
-            {27: 'escape', 32: 'space', 65: 'a', 160: 'shift', 161: 'shift'}
         """
-        # Reverse lookup to convert PsychHID integer codes back to logical names.
-        self._code_names: dict[int, str] = {
-            code: key for key in sorted(keys) for code in resolve_key(key)
-        }
+
+        self._queue: SimpleQueue[KeyEvent] = queue
+        self._keys: set[str] = set()
+        self._codes: dict[int, str] = {}
 
         self._started: bool = False
+        self._enabled: bool = False
         self._stopped: bool = False
         self._error: BaseException | None = None
-        self._queue: SimpleQueue[KeyEvent] = SimpleQueue()
         self._thread: Thread = Thread(target=self._worker, daemon=True)
 
     @property
@@ -212,19 +206,38 @@ class KeyboardQueue:
     def is_stopped(self) -> bool:
         return self._stopped
 
+    def add_keys(self, keys: Iterable[str] | str) -> None:
+        if self.is_started():
+            raise RuntimeError("Cannot add keys to a started queue")
+        if self.is_stopped():
+            raise RuntimeError("Cannot add keys to a stopped queue")
+
+        if isinstance(keys, str):
+            self._keys.add(keys)
+        elif isinstance(keys, Iterable):
+            self._keys.update(keys)
+        else:
+            raise TypeError("keys must be a string or an iterable of strings")
+
+    def _init_codes(self) -> dict[int, str]:
+        return {code: key for key in sorted(self._keys) for code in resolve_key(key)}
+
     def start(self) -> None:
-        """
-        Start the PsychHID keyboard queue.
-        Starts a worker thread to bridge PsychHID -> SimpleQueue.
-        """
         if self.is_started():
             raise RuntimeError("Keyboard queue already started")
         if self.is_stopped():
             raise RuntimeError("KeyboardQueue cannot be restarted once stopped")
 
+        if not self._keys:
+            self._started = True
+            self._enabled = False
+            return
+
+        self._codes = self._init_codes()
+
         # Converts requested key to PsychHID key mask
         mask = [0] * 256
-        for code in self._code_names:
+        for code in self._codes:
             mask[code - 1] = 1  # PsychHID one-based keycode -> zero-based mask index
 
         PsychHID("KbQueueCreate", None, mask, 0, 10_000, 0, None)
@@ -233,6 +246,7 @@ class KeyboardQueue:
             GetSecs()  # Warm up Psychtoolbox's high-resolution Windows clock.
             self._thread.start()
             self._started = True
+            self._enabled = True
         except Exception:
             PsychHID("KbQueueRelease", None)
             raise
@@ -243,6 +257,9 @@ class KeyboardQueue:
 
         self._stopped = True
         self._started = False
+        if not self._enabled:
+            return
+
         self._thread.join()
 
         try:
@@ -270,10 +287,11 @@ class KeyboardQueue:
                     # Drain any other already-queued HID events without blocking
                     hid_event = self._hid_get_event(0.0)
 
-                # Release the GIL so the audio callback can run.
-                sleep(0.001)
-        except BaseException as error:
-            self._error = error
+                sleep(0.001)  # Release the GIL so the audio callback can run.
+
+        except Exception as e:  # noqa: BLE001
+            self._error = e
+        finally:
             self._stopped = True
 
     def _to_key_event(self, raw: PsychHIDEvent) -> KeyEvent | None:
@@ -282,7 +300,7 @@ class KeyboardQueue:
             return None
 
         raw_code = int(raw["Keycode"])
-        key = self._code_names.get(raw_code)
+        key = self._codes.get(raw_code)
         if key is None:
             return None
 
@@ -303,7 +321,9 @@ if __name__ == "__main__":
     import time
 
     keys = {"space", "escape", "a", "shift"}
-    keyboard = KeyboardQueue(keys)
+    queue = SimpleQueue()
+    keyboard = KeyboardQueue(queue)
+    keyboard.add_keys(keys)
     keyboard.start()
 
     while True:
