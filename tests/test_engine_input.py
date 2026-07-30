@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 from unittest.mock import patch
 
 import numpy as np

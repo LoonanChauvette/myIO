@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
-from queue import Empty, SimpleQueue
+from collections.abc import Iterable
 from threading import Thread
 from time import sleep
 from typing import TypedDict
@@ -10,6 +8,8 @@ from typing import TypedDict
 import numpy as np
 import numpy.typing as npt
 from psychtoolbox import GetSecs, PsychHID
+
+from myio.events import BaseEvent, EventQueue, KeyEvent
 
 
 def key_codes(*values: int) -> tuple[int, ...]:
@@ -150,17 +150,8 @@ def resolve_key(key: str) -> tuple[int, ...]:
     return WINDOWS_KEY_CODES[normalize_key_name(key)]
 
 
-@dataclass(slots=True)
-class KeyEvent:
-    key: str  # Normalized virtual key name
-    pressed: bool  # True for press events, False for release events
-    timestamp: float  # Time of the event in seconds
-    raw_code: int  # DirectInput scan code (one-based)
-    sample: int | None = None  # Sample number at the time of the event (set by engine)
-
-
 class KeyboardQueue:
-    def __init__(self, queue: SimpleQueue) -> None:
+    def __init__(self, queue: EventQueue[BaseEvent]) -> None:
         """
         Initialize the keyboard queue with the requested keys.
 
@@ -168,7 +159,7 @@ class KeyboardQueue:
         PsychHID key codes to logical key names.
         """
 
-        self._queue: SimpleQueue[KeyEvent] = queue
+        self._queue: EventQueue[BaseEvent] = queue
         self._keys: set[str] = set()
         self._codes: dict[int, str] = {}
 
@@ -177,23 +168,6 @@ class KeyboardQueue:
         self._stopped: bool = False
         self._error: BaseException | None = None
         self._thread: Thread = Thread(target=self._worker, daemon=True)
-
-    @property
-    def pending_events(self) -> Iterator[KeyEvent]:
-        """
-        Allows iterating over pending events, draining the queue.
-            >>> for event in keyboard.pending_events:
-            ...     print(event)
-
-        Also allows draining the queue by iterating over this property.
-            >>> for _ in self.pending_events:
-            ...     pass
-        """
-        while True:
-            try:
-                yield self._queue.get_nowait()
-            except Empty:
-                return
 
     @property
     def error(self) -> BaseException | None:
@@ -266,8 +240,6 @@ class KeyboardQueue:
             PsychHID("KbQueueStop", None)
         finally:
             PsychHID("KbQueueRelease", None)
-            for _ in self.pending_events:
-                pass
 
     def _worker(self) -> None:
         """
@@ -321,12 +293,12 @@ if __name__ == "__main__":
     import time
 
     keys = {"space", "escape", "a", "shift"}
-    queue = SimpleQueue()
+    queue = EventQueue()
     keyboard = KeyboardQueue(queue)
     keyboard.add_keys(keys)
     keyboard.start()
 
     while True:
-        for event in keyboard.pending_events:
+        for event in queue.pending_events:
             print(event)
         time.sleep(0.01)

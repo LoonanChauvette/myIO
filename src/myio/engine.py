@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from queue import SimpleQueue
 from threading import Lock
 from typing import Literal, Self, TypedDict, Unpack
 
@@ -12,7 +11,8 @@ import sounddevice as sd
 
 from myio.audiosources import AudioContext, AudioSource
 from myio.clock import CallbackTime, Clock
-from myio.keyboard import KeyboardQueue, KeyEvent, normalize_key_name
+from myio.events import BaseEvent, CallbackEvent, EventQueue
+from myio.keyboard import KeyboardQueue, normalize_key_name
 
 AudioType = Literal["float32", "int32", "int16", "int8", "uint8"]
 StreamLatency = Literal["low", "high"]
@@ -63,12 +63,11 @@ class AudioEngine:
         )
 
         self.clock: Clock = Clock(self.samplerate, self.blocksize)
+        self.event_queue: EventQueue = EventQueue()
+        self.keyboard: KeyboardQueue = KeyboardQueue(self.event_queue)
 
         self._engine_lock: Lock = Lock()
         self._handles: tuple[Handle, ...] = ()
-
-        self.event_queue: SimpleQueue = SimpleQueue()
-        self.keyboard: KeyboardQueue = KeyboardQueue(self.event_queue)
 
     @classmethod
     def default(cls) -> Self:
@@ -126,17 +125,20 @@ class AudioEngine:
         with self._engine_lock:
             if self.stream.active:
                 raise RuntimeError("Cannot register keys while the engine is running")
-            self.keyboard.add_keys({name})
+            try:
+                self.keyboard.add_keys({name})
+            except RuntimeError as e:
+                raise RuntimeError(f"Failed to register key {name}") from e
 
     def start(self) -> None:
-        with self._engine_lock:
-            try:
+        try:
+            with self._engine_lock:
                 self.keyboard.start()
                 self.stream.start()
                 return
-            except Exception as exc:
-                self.stop()
-                raise RuntimeError("Failed to start the engine") from exc
+        except Exception as exc:
+            self.stop()
+            raise RuntimeError("Failed to start the engine") from exc
 
     def stop(self) -> None:
         with self._engine_lock:
@@ -145,42 +147,33 @@ class AudioEngine:
             self.stream.close()
             self.keyboard.stop()
 
-    def _drain_pending_events(self, time: CallbackTime) -> tuple[KeyEvent, ...]:
-        keyboard = self.keyboard
+            for _ in self.event_queue.pending_events:
+                pass
 
+    def _collect_events(self, clock: Clock) -> list[BaseEvent]:
+        event_queue = self.event_queue
+        keyboard = self.keyboard
         if keyboard.error is not None:
             raise RuntimeError("Keyboard worker failed") from keyboard.error
 
-        events: list[KeyEvent] = []
-        for event in keyboard.pending_events:
-            offset = event.timestamp - time.outputBufferDacTime
-            local_sample = offset * self.samplerate
-            event.sample = self.clock.frame + round(local_sample)
+        events = []
+        for event in event_queue.pending_events:
+            if event.sample is None:
+                offset = event.timestamp - clock.output_time
+                local_sample = offset * self.samplerate
+                event.sample = clock.frame + round(local_sample)
             events.append(event)
+        return events
 
-        return tuple(events)
-
-    def render(
-        self, outdata: npt.NDArray[np.float32], frames: int, time: CallbackTime
-    ) -> None:
+    def render(self, outdata: npt.NDArray[np.float32], ctx: AudioContext) -> None:
 
         outdata.fill(0)
 
-        clock = self.clock
-        clock.tick(frames, time)
-
-        context = AudioContext(
-            frames=frames,
-            samplerate=self.samplerate,
-            clock=clock,
-            events=self._drain_pending_events(time),
-        )
-
         handles = self._handles
         for handle in handles:
-            buffer = handle.buffer[:frames]
+            buffer = handle.buffer[: ctx.frames]
             buffer.fill(0)
-            handle.render(buffer, context)
+            handle.render(buffer, ctx)
 
             for route in handle.routes:
                 outdata[:, route.dst] += route.gain * buffer[:, route.src]
@@ -192,4 +185,23 @@ class AudioEngine:
         time: CallbackTime,
         status: sd.CallbackFlags,
     ) -> None:
-        self.render(outdata, frames, time)
+        clock = self.clock
+        clock.tick(frames, time)
+
+        events = self._collect_events(clock)
+        if status:
+            events.append(
+                CallbackEvent(
+                    timestamp=clock.current_time,
+                    sample=clock.frame,
+                    output_underflow=status.output_underflow,
+                    output_overflow=status.output_overflow,
+                    input_underflow=status.input_underflow,
+                    input_overflow=status.input_overflow,
+                )
+            )
+
+        context = AudioContext(
+            frames=frames, samplerate=self.samplerate, clock=clock, events=events
+        )
+        self.render(outdata, context)

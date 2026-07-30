@@ -5,10 +5,9 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
-import sounddevice as sd
 
-from myio.clock import CallbackTime, Clock
-from myio.keyboard import KeyEvent
+from myio.clock import Clock
+from myio.events import BaseEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,7 +15,7 @@ class AudioContext:
     frames: int
     samplerate: float
     clock: Clock
-    events: tuple[KeyEvent, ...] = ()
+    events: list[BaseEvent]
 
 
 @runtime_checkable
