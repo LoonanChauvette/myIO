@@ -3,13 +3,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from threading import Thread
 from time import sleep
-from typing import TypedDict
 
-import numpy as np
-import numpy.typing as npt
 from psychtoolbox import GetSecs, PsychHID
 
-from myio.events import BaseEvent, EventQueue, KeyEvent
+from myio.events import BaseEvent, EventQueue, KeyEvent, PsychHIDEvent
 
 
 def key_codes(*values: int) -> tuple[int, ...]:
@@ -116,25 +113,6 @@ ALIASES = {
     "pagedown": "page_down",
     "spacebar": "space",
 }
-
-# Type for the return struct of PsychHID('KbQueueGetEvent')
-PsychHIDEvent = TypedDict(
-    "PsychHIDEvent",
-    {
-        "Type": float,
-        "Time": float,
-        "Pressed": float,
-        "Keycode": float,
-        "CookedKey": float,
-        "ButtonStates": float,
-        "Motion": float,
-        "X": float,
-        "Y": float,
-        "NormX": float,
-        "NormY": float,
-        "Valuators": npt.NDArray[np.float64],
-    },
-)
 
 
 def normalize_key_name(key: str) -> str:
@@ -248,16 +226,13 @@ class KeyboardQueue:
         """
         try:
             while not self.is_stopped():
-                hid_event = self._hid_get_event(0.0)
+                hid_event = self._hid_get_event()
 
-                # If a HID event is available, convert it to KeyEvent and put it on the queue
                 while hid_event is not None:
-                    key_event = self._to_key_event(hid_event)
+                    key_event = KeyEvent.from_hid_event(hid_event, self._codes)
                     if key_event is not None:
                         self._queue.put(key_event)
-
-                    # Drain any other already-queued HID events without blocking
-                    hid_event = self._hid_get_event(0.0)
+                    hid_event = self._hid_get_event()
 
                 sleep(0.001)  # Release the GIL so the audio callback can run.
 

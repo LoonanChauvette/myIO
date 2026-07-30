@@ -41,6 +41,16 @@ class Handle:
     buffer: np.ndarray
     routes: list[Route]
 
+    @classmethod
+    def from_source(cls, source: AudioSource, max: int, routes: list[Route]) -> Self:
+        return cls(
+            source=source,
+            render=source.mix,
+            channels=source.channels,
+            buffer=np.empty((max, source.channels), dtype=np.float32),
+            routes=routes,
+        )
+
 
 @dataclass
 class Route:
@@ -91,13 +101,7 @@ class AudioEngine:
 
     def add(self, source: AudioSource, routes: list[Route]) -> Handle:
         # TODO: default routes to all dst channels
-        handle = Handle(
-            source=source,
-            render=source.mix,
-            channels=source.channels,
-            buffer=np.empty((self.MAX_BLOCKSIZE, source.channels), dtype=np.float32),
-            routes=routes,
-        )
+        handle = Handle.from_source(source, self.MAX_BLOCKSIZE, routes)
 
         with self._engine_lock:
             # handles are stored as an immutable tuple (better for the render loop)
@@ -166,15 +170,12 @@ class AudioEngine:
         return events
 
     def render(self, outdata: npt.NDArray[np.float32], ctx: AudioContext) -> None:
-
         outdata.fill(0)
-
         handles = self._handles
         for handle in handles:
             buffer = handle.buffer[: ctx.frames]
             buffer.fill(0)
             handle.render(buffer, ctx)
-
             for route in handle.routes:
                 outdata[:, route.dst] += route.gain * buffer[:, route.src]
 
@@ -191,17 +192,7 @@ class AudioEngine:
         events = self._collect_events(clock)
         if status:
             events.append(
-                CallbackEvent(
-                    timestamp=clock.current_time,
-                    sample=clock.frame,
-                    output_underflow=status.output_underflow,
-                    output_overflow=status.output_overflow,
-                    input_underflow=status.input_underflow,
-                    input_overflow=status.input_overflow,
-                )
+                CallbackEvent.from_flags(status, clock.current_time, clock.frame)
             )
 
-        context = AudioContext(
-            frames=frames, samplerate=self.samplerate, clock=clock, events=events
-        )
-        self.render(outdata, context)
+        self.render(outdata, AudioContext(frames, self.samplerate, clock, events))
